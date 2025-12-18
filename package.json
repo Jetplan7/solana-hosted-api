@@ -1,0 +1,17 @@
+{
+  "name": "solana-hosted-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "@solana/web3.js": "^1.95.4"
+  }
+}
