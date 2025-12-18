@@ -5,7 +5,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction 
 
 dotenv.config();
 
-const VERSION = "1.4.7-fix6";
+const VERSION = "1.4.8-fix7";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -64,21 +64,71 @@ async function loadSdk() {
   return { mod, sdk };
 }
 
-function safeJsonInfo2PoolKeys(sdk, apiPool) {
-  // Raydium SDK expects a "json pool info" object and converts strings -> PublicKeys etc.
-  // This is the missing step that caused _bn errors.
-  if (typeof sdk.jsonInfo2PoolKeys === "function") {
-    return sdk.jsonInfo2PoolKeys(apiPool);
+function buildJsonInfoVariants(apiPool) {
+  const mintA = apiPool?.mintA?.address || apiPool?.mintA;
+  const mintB = apiPool?.mintB?.address || apiPool?.mintB;
+  const configId = apiPool?.config?.id || apiPool?.ammConfigId || apiPool?.ammConfig || apiPool?.configId;
+
+  // Some Raydium helpers want strings for mints; others accept nested objects.
+  const minimal = {
+    id: apiPool.id,
+    programId: apiPool.programId,
+    poolProgramId: apiPool.programId,
+    type: apiPool.type,
+    mintA,
+    mintB,
+    config: configId ? { id: configId } : apiPool.config,
+    ammConfigId: configId,
+    // Keep originals if present
+    openTime: apiPool.openTime,
+    feeRate: apiPool.feeRate,
+    tickSpacing: apiPool?.config?.tickSpacing,
+  };
+
+  const stringMints = {
+    id: apiPool.id,
+    programId: apiPool.programId,
+    poolProgramId: apiPool.programId,
+    type: apiPool.type,
+    mintA: mintA,
+    mintB: mintB,
+    configId,
+  };
+
+  return [
+    { name: "full_apiPool", jsonInfo: apiPool },
+    { name: "minimal", jsonInfo: minimal },
+    { name: "stringMints", jsonInfo: stringMints },
+  ];
+}
+
+function findJsonInfo2PoolKeys(sdk) {
+  return sdk.jsonInfo2PoolKeys || sdk.PoolUtils?.jsonInfo2PoolKeys || null;
+}
+
+async function jsonInfoToPoolKeys(sdk, apiPool) {
+  const fn = findJsonInfo2PoolKeys(sdk);
+  if (!fn) throw new Error("jsonInfo2PoolKeys not found in Raydium SDK exports.");
+
+  const variants = buildJsonInfoVariants(apiPool);
+  const attempts = [];
+
+  for (const v of variants) {
+    try {
+      const poolKeys = fn(v.jsonInfo);
+      attempts.push({ name: v.name, ok: true, poolKeysKeys: Object.keys(poolKeys || {}) });
+      return { poolKeys, used: v.name, attempts };
+    } catch (e) {
+      attempts.push({ name: v.name, ok: false, error: e?.message || String(e) });
+    }
   }
-  if (sdk.PoolUtils?.jsonInfo2PoolKeys) {
-    return sdk.PoolUtils.jsonInfo2PoolKeys(apiPool);
-  }
-  throw new Error("jsonInfo2PoolKeys not found in Raydium SDK exports.");
+
+  throw new Error("jsonInfo2PoolKeys failed for all variants: " + JSON.stringify(attempts, null, 2));
 }
 
 async function fetchClmmPoolInfo(clmm, sdk, apiPool) {
   const poolId = new PublicKey(apiPool.id);
-  const poolKeys = safeJsonInfo2PoolKeys(sdk, apiPool);
+  const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
 
   // The CLMM fetcher in your build uses poolKeys.map(...) so poolKeys must be provided.
   const res = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
@@ -89,7 +139,7 @@ async function fetchClmmPoolInfo(clmm, sdk, apiPool) {
   if (!poolInfo) {
     throw new Error("fetchMultiplePoolInfos returned no poolInfo. resKeys=" + JSON.stringify(Object.keys(res || {})));
   }
-  return { poolId, poolKeys, poolInfo };
+  return { poolId, poolKeys, poolInfo, poolKeysVariant: used, poolKeysAttempts: attempts };
 }
 
 async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
@@ -101,7 +151,7 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
   if (!clmm.fetchMultiplePoolInfos) throw new Error("Clmm.fetchMultiplePoolInfos missing.");
   if (!clmm.makeSwapBaseInInstructions) throw new Error("Clmm.makeSwapBaseInInstructions missing.");
 
-  const { poolId, poolKeys, poolInfo } = await fetchClmmPoolInfo(clmm, sdk, apiPool);
+  const { poolId, poolKeys, poolInfo, poolKeysVariant, poolKeysAttempts } = await fetchClmmPoolInfo(clmm, sdk, apiPool);
 
   const { usdcAta, wsolAta } = deriveAtas(owner);
 
@@ -137,6 +187,8 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
       version: VERSION,
       poolType: apiPool?.type,
       poolProgramId: apiPool?.programId,
+      poolKeysVariant,
+      poolKeysAttempts,
       poolInfoKeys: Object.keys(poolInfo || {}),
       poolKeysKeys: Object.keys(poolKeys || {}),
       tickDiag,
@@ -159,25 +211,23 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-app.get("/raydium-raw", async (_req, res) => {
-  try {
-    rateLimit();
-    const pool = await fetchBestPool();
-    res.json({ ok: true, keys: Object.keys(pool), pool });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 app.get("/try-fetch", async (_req, res) => {
   try {
     rateLimit();
     const { sdk } = await loadSdk();
     const apiPool = await fetchBestPool();
     const clmm = sdk.Clmm;
-    const poolKeys = safeJsonInfo2PoolKeys(sdk, apiPool);
-    const out = { ok: true, version: VERSION, hasJsonInfo2PoolKeys: true, poolId: apiPool.id, poolKeysKeys: Object.keys(poolKeys || {}) };
+    const out = { ok: true, version: VERSION, poolId: apiPool.id, poolType: apiPool.type, poolProgramId: apiPool.programId };
+
+    const fn = findJsonInfo2PoolKeys(sdk);
+    out.hasJsonInfo2PoolKeys = !!fn;
+
     try {
+      const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
+      out.poolKeysVariant = used;
+      out.poolKeysAttempts = attempts;
+      out.poolKeysKeys = Object.keys(poolKeys || {});
+
       const r = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
       out.fetchOk = true;
       out.resKeys = Object.keys(r || {});
@@ -186,6 +236,7 @@ app.get("/try-fetch", async (_req, res) => {
       out.fetchOk = false;
       out.fetchError = e?.message || String(e);
     }
+
     res.json(out);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

@@ -1,16 +1,7 @@
-# CLMM auto-ATA fix6
+# CLMM auto-ATA fix7
 
-Your /try-fetch showed:
-- fetchMultiplePoolInfos expects `poolKeys` (it does poolKeys.map internally)
-- Our earlier poolKeys were the wrong shape, causing `_bn` errors
+Fixes "invalid public key ... value=\"Concentrated\"" by not passing the raw Raydium API pool object blindly into jsonInfo2PoolKeys.
 
-This build uses Raydium SDK's `jsonInfo2PoolKeys(apiPool)` to convert the Raydium API pool JSON into the
-correct `poolKeys` struct (PublicKeys, BN values, etc).
-
-Then it calls:
+This build tries multiple "jsonInfo" shapes (full, minimal, stringMints) and reports which one works,
+then uses the produced poolKeys in:
   Clmm.fetchMultiplePoolInfos({ poolKeys: [poolKeys] })
-
-After deploy:
-- GET /version => 1.4.7-fix6
-- GET /try-fetch => fetchOk should be true
-- POST /build-tx => should return ok:true + base64 tx
