@@ -5,7 +5,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction 
 
 dotenv.config();
 
-const VERSION = "1.4.8-fix7";
+const VERSION = "1.4.9-fix8";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -64,46 +64,42 @@ async function loadSdk() {
   return { mod, sdk };
 }
 
+function findJsonInfo2PoolKeys(sdk) {
+  return sdk.jsonInfo2PoolKeys || sdk.PoolUtils?.jsonInfo2PoolKeys || null;
+}
+
+function normalizeMint(x) {
+  return x?.address || x?.mint || x || null;
+}
 function buildJsonInfoVariants(apiPool) {
-  const mintA = apiPool?.mintA?.address || apiPool?.mintA;
-  const mintB = apiPool?.mintB?.address || apiPool?.mintB;
+  const mintA = normalizeMint(apiPool?.mintA);
+  const mintB = normalizeMint(apiPool?.mintB);
+  const programId = apiPool?.programId || apiPool?.poolProgramId || apiPool?.ammProgramId;
   const configId = apiPool?.config?.id || apiPool?.ammConfigId || apiPool?.ammConfig || apiPool?.configId;
 
-  // Some Raydium helpers want strings for mints; others accept nested objects.
-  const minimal = {
+  // Key idea: DO NOT pass `type` at all (some SDK builds treat certain fields positionally and try to PublicKey() it).
+  const clmmOnly = {
     id: apiPool.id,
-    programId: apiPool.programId,
-    poolProgramId: apiPool.programId,
-    type: apiPool.type,
+    programId,
     mintA,
     mintB,
-    config: configId ? { id: configId } : apiPool.config,
     ammConfigId: configId,
-    // Keep originals if present
-    openTime: apiPool.openTime,
-    feeRate: apiPool.feeRate,
-    tickSpacing: apiPool?.config?.tickSpacing,
+    config: configId ? { id: configId } : undefined,
   };
 
-  const stringMints = {
+  const clmmOnly2 = {
     id: apiPool.id,
-    programId: apiPool.programId,
-    poolProgramId: apiPool.programId,
-    type: apiPool.type,
-    mintA: mintA,
-    mintB: mintB,
-    configId,
+    programId,
+    mintA: { address: mintA },
+    mintB: { address: mintB },
+    config: configId ? { id: configId } : undefined,
   };
 
   return [
-    { name: "full_apiPool", jsonInfo: apiPool },
-    { name: "minimal", jsonInfo: minimal },
-    { name: "stringMints", jsonInfo: stringMints },
+    { name: "full_apiPool_strippedType", jsonInfo: (() => { const { type, pooltype, ...rest } = apiPool; return rest; })() },
+    { name: "clmmOnly_strings", jsonInfo: clmmOnly },
+    { name: "clmmOnly_nestedMint", jsonInfo: clmmOnly2 },
   ];
-}
-
-function findJsonInfo2PoolKeys(sdk) {
-  return sdk.jsonInfo2PoolKeys || sdk.PoolUtils?.jsonInfo2PoolKeys || null;
 }
 
 async function jsonInfoToPoolKeys(sdk, apiPool) {
@@ -130,15 +126,11 @@ async function fetchClmmPoolInfo(clmm, sdk, apiPool) {
   const poolId = new PublicKey(apiPool.id);
   const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
 
-  // The CLMM fetcher in your build uses poolKeys.map(...) so poolKeys must be provided.
   const res = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
-
   const byId = res?.[poolId.toBase58()];
   const first = res?.poolInfos?.[0] || res?.infos?.[0] || res?.[0] || null;
   const poolInfo = byId || first || null;
-  if (!poolInfo) {
-    throw new Error("fetchMultiplePoolInfos returned no poolInfo. resKeys=" + JSON.stringify(Object.keys(res || {})));
-  }
+  if (!poolInfo) throw new Error("fetchMultiplePoolInfos returned no poolInfo. resKeys=" + JSON.stringify(Object.keys(res || {})));
   return { poolId, poolKeys, poolInfo, poolKeysVariant: used, poolKeysAttempts: attempts };
 }
 
@@ -148,23 +140,9 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
 
   const clmm = sdk?.Clmm;
   if (!clmm) throw new Error("Raydium SDK Clmm missing.");
-  if (!clmm.fetchMultiplePoolInfos) throw new Error("Clmm.fetchMultiplePoolInfos missing.");
-  if (!clmm.makeSwapBaseInInstructions) throw new Error("Clmm.makeSwapBaseInInstructions missing.");
-
   const { poolId, poolKeys, poolInfo, poolKeysVariant, poolKeysAttempts } = await fetchClmmPoolInfo(clmm, sdk, apiPool);
 
   const { usdcAta, wsolAta } = deriveAtas(owner);
-
-  // Best effort: prefetch tick arrays (some versions do it internally, but this helps)
-  let tickDiag = null;
-  try {
-    if (clmm.fetchMultiplePoolTickArrays) {
-      const tick = await clmm.fetchMultiplePoolTickArrays({ connection, poolInfos: [poolInfo] });
-      tickDiag = { ok: true, keys: Object.keys(tick || {}) };
-    }
-  } catch (e) {
-    tickDiag = { ok: false, error: e?.message || String(e) };
-  }
 
   const r = await clmm.makeSwapBaseInInstructions({
     connection,
@@ -191,7 +169,6 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
       poolKeysAttempts,
       poolInfoKeys: Object.keys(poolInfo || {}),
       poolKeysKeys: Object.keys(poolKeys || {}),
-      tickDiag,
       sdkKeysCount: Object.keys(sdk || {}).length,
       sdkTopKeysCount: Object.keys(mod || {}).length,
     },
@@ -201,26 +178,15 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
 /* Routes */
 app.get("/version", (_req, res) => res.json({ ok: true, version: VERSION }));
 
-app.get("/health", async (_req, res) => {
-  try {
-    rateLimit();
-    const bh = await connection.getBlockHeight();
-    res.json({ ok: true, version: VERSION, rpc: RPC, blockHeight: bh });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 app.get("/try-fetch", async (_req, res) => {
   try {
     rateLimit();
     const { sdk } = await loadSdk();
     const apiPool = await fetchBestPool();
     const clmm = sdk.Clmm;
-    const out = { ok: true, version: VERSION, poolId: apiPool.id, poolType: apiPool.type, poolProgramId: apiPool.programId };
 
-    const fn = findJsonInfo2PoolKeys(sdk);
-    out.hasJsonInfo2PoolKeys = !!fn;
+    const out = { ok: true, version: VERSION, poolId: apiPool.id, poolType: apiPool.type, poolProgramId: apiPool.programId };
+    out.hasJsonInfo2PoolKeys = !!findJsonInfo2PoolKeys(sdk);
 
     try {
       const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
@@ -248,9 +214,7 @@ app.get("/derive/:wallet", async (req, res) => {
     rateLimit();
     const owner = new PublicKey(req.params.wallet);
     const { usdcAta, wsolAta } = deriveAtas(owner);
-    const usdcExists = !!(await connection.getAccountInfo(usdcAta));
-    const wsolExists = !!(await connection.getAccountInfo(wsolAta));
-    res.json({ ok: true, version: VERSION, wallet: owner.toBase58(), usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58(), usdcAtaExists: usdcExists, wsolAtaExists: wsolExists });
+    res.json({ ok: true, version: VERSION, wallet: owner.toBase58(), usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58() });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -295,13 +259,11 @@ app.post("/build-tx", async (req, res) => {
         version: VERSION,
         note: m,
         pool: built.poolId.toBase58(),
-        atas: { usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58() },
         diag: built.diag,
         tx: tx.serialize({ requireAllSignatures: false }).toString("base64"),
       });
     }
 
-    // noop
     tx.add(new TransactionInstruction({ programId: new PublicKey("11111111111111111111111111111111"), keys: [], data: Buffer.alloc(0) }));
     const { blockhash } = await connection.getLatestBlockhash();
     tx.recentBlockhash = blockhash;
