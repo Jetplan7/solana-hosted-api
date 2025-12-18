@@ -5,7 +5,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction 
 
 dotenv.config();
 
-const VERSION = "1.5.0-fix9";
+const VERSION = "1.5.1-fix10";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -64,137 +64,66 @@ async function loadSdk() {
   return { mod, sdk };
 }
 
-function findJsonInfo2PoolKeys(sdk) {
-  return sdk.jsonInfo2PoolKeys || sdk.PoolUtils?.jsonInfo2PoolKeys || null;
-}
-
-function normalizeMint(x) {
-  return x?.address || x?.mint || x || null;
-}
-
-function buildJsonInfoVariants(apiPool) {
-  const mintA = normalizeMint(apiPool?.mintA);
-  const mintB = normalizeMint(apiPool?.mintB);
-  const programId = apiPool?.programId || apiPool?.poolProgramId || apiPool?.ammProgramId;
-  const configId = apiPool?.config?.id || apiPool?.ammConfigId || apiPool?.ammConfig || apiPool?.configId;
-
-  const clmmOnly = {
-    id: apiPool.id,
-    programId,
-    mintA,
-    mintB,
-    ammConfigId: configId,
-    config: configId ? { id: configId } : undefined,
-  };
-
-  return [
-    { name: "clmmOnly_strings", jsonInfo: clmmOnly },
-  ];
-}
-
-function isPubkeyLike(x) {
-  return x && typeof x === "object" && (x instanceof PublicKey || x._bn);
-}
-function coercePubkey(x) {
-  if (!x) return x;
-  if (x instanceof PublicKey) return x;
-  if (typeof x === "string") return new PublicKey(x);
-  // some sdk provides publicKey() helper
+function pkFromLayoutField(x) {
+  // BufferLayout often returns Uint8Array(32) or Buffer
+  if (!x) return null;
   try {
-    if (x?.toBase58) return new PublicKey(x.toBase58());
+    if (x instanceof PublicKey) return x;
+    if (typeof x === "string") return new PublicKey(x);
+    if (x.length === 32) return new PublicKey(x);
   } catch {}
-  return x;
+  return null;
 }
 
-function coercePoolKeys(poolKeys) {
-  // Ensure critical fields are actual PublicKey objects (have _bn)
-  if (!poolKeys || typeof poolKeys !== "object") return poolKeys;
-  const out = { ...poolKeys };
-
-  // direct keys
-  for (const k of ["id", "programId", "mintA", "mintB", "ammConfigId"]) {
-    if (out[k]) out[k] = coercePubkey(out[k]);
-  }
-  // config.id
-  if (out.config && typeof out.config === "object" && out.config.id) {
-    out.config = { ...out.config, id: coercePubkey(out.config.id) };
+function extractPubkeys(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    const pk = pkFromLayoutField(v);
+    if (pk) out[k] = pk.toBase58();
   }
   return out;
 }
 
-function describeValue(v) {
-  if (v === null) return { type: "null" };
-  if (v === undefined) return { type: "undefined" };
-  const t = typeof v;
-  if (t !== "object") return { type: t, sample: String(v).slice(0, 120) };
-  const name = v?.constructor?.name || "Object";
-  const pk = v instanceof PublicKey || v?._bn ? true : false;
-  let base58 = null;
-  try { if (v?.toBase58) base58 = v.toBase58(); } catch {}
-  return { type: "object", ctor: name, pubkeyLike: pk, base58 };
-}
-
-async function jsonInfoToPoolKeys(sdk, apiPool) {
-  const fn = findJsonInfo2PoolKeys(sdk);
-  if (!fn) throw new Error("jsonInfo2PoolKeys not found in Raydium SDK exports.");
-
-  const variants = buildJsonInfoVariants(apiPool);
-  const attempts = [];
-
-  for (const v of variants) {
-    try {
-      const rawPoolKeys = fn(v.jsonInfo);
-      const poolKeys = coercePoolKeys(rawPoolKeys);
-      const keyDesc = {};
-      for (const k of Object.keys(poolKeys || {})) keyDesc[k] = describeValue(poolKeys[k]);
-      if (poolKeys?.config) keyDesc["config"] = describeValue(poolKeys.config);
-      if (poolKeys?.config?.id) keyDesc["config.id"] = describeValue(poolKeys.config.id);
-
-      attempts.push({ name: v.name, ok: true, poolKeysKeys: Object.keys(poolKeys || {}), poolKeysDesc: keyDesc });
-      return { poolKeys, used: v.name, attempts };
-    } catch (e) {
-      attempts.push({ name: v.name, ok: false, error: e?.message || String(e) });
-    }
-  }
-
-  throw new Error("jsonInfo2PoolKeys failed: " + JSON.stringify(attempts, null, 2));
-}
-
-async function tryFetchWithPoolKeys(clmm, poolId, poolKeys) {
-  try {
-    const res = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
-    const byId = res?.[poolId.toBase58()];
-    const first = res?.poolInfos?.[0] || res?.infos?.[0] || res?.[0] || null;
-    const poolInfo = byId || first || null;
-    return { ok: !!poolInfo, resKeys: Object.keys(res || {}), poolInfoKeys: poolInfo ? Object.keys(poolInfo) : null };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
-  }
-}
-
-async function fetchClmmPoolInfo(clmm, sdk, apiPool) {
-  const poolId = new PublicKey(apiPool.id);
-  const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
-  const fetchTry = await tryFetchWithPoolKeys(clmm, poolId, poolKeys);
-  if (!fetchTry.ok) {
-    throw new Error("fetchMultiplePoolInfos failed: " + JSON.stringify(fetchTry, null, 2));
-  }
-  // We need poolInfo for swap; fetchTry.poolInfoKeys just for diag.
-  const res = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
-  const byId = res?.[poolId.toBase58()];
-  const first = res?.poolInfos?.[0] || res?.infos?.[0] || res?.[0] || null;
-  const poolInfo = byId || first || null;
-  return { poolId, poolKeys, poolInfo, poolKeysVariant: used, poolKeysAttempts: attempts };
+async function decodeClmmPoolState(sdk, poolId) {
+  if (!sdk.PoolInfoLayout?.decode) throw new Error("PoolInfoLayout.decode missing in Raydium SDK");
+  const acc = await connection.getAccountInfo(poolId);
+  if (!acc?.data) throw new Error("Pool account not found");
+  const decoded = sdk.PoolInfoLayout.decode(acc.data);
+  // Try to convert commonly named pubkey fields if present
+  const pubkeys = extractPubkeys(decoded);
+  return { decodedKeys: Object.keys(decoded), pubkeys };
 }
 
 async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
-  const { mod, sdk } = await loadSdk();
+  const { sdk } = await loadSdk();
   const apiPool = await fetchBestPool();
-  const clmm = sdk?.Clmm;
-  if (!clmm) throw new Error("Raydium SDK Clmm missing.");
+  const poolId = new PublicKey(apiPool.id);
+  const programId = new PublicKey(apiPool.programId);
 
-  const { poolId, poolKeys, poolInfo, poolKeysVariant, poolKeysAttempts } = await fetchClmmPoolInfo(clmm, sdk, apiPool);
+  // We avoid Clmm.fetchMultiplePoolInfos entirely (it is broken on your environment).
+  // Instead decode on-chain pool state and feed it to the swap builder where possible.
+  const { decodedKeys, pubkeys } = await decodeClmmPoolState(sdk, poolId);
+
   const { usdcAta, wsolAta } = deriveAtas(owner);
+
+  // Minimal poolKeys; swap builder may only need id/programId (others inside poolInfo)
+  const poolKeys = { id: poolId, programId };
+
+  // Build a "poolInfo" object that includes id + what we can decode
+  const acc = await connection.getAccountInfo(poolId);
+  const decoded = sdk.PoolInfoLayout.decode(acc.data);
+  const poolInfo = { ...decoded, id: poolId, programId };
+
+  // Some decoders leave pubkeys as bytes; ensure at least mintA/mintB/config id if present
+  for (const k of ["mintA", "mintB", "mint0", "mint1", "ammConfigId", "configId", "vaultA", "vaultB", "observationId"]) {
+    if (poolInfo[k]) {
+      const pk = pkFromLayoutField(poolInfo[k]);
+      if (pk) poolInfo[k] = pk;
+    }
+  }
+
+  const clmm = sdk.Clmm;
+  if (!clmm?.makeSwapBaseInInstructions) throw new Error("Clmm.makeSwapBaseInInstructions missing");
 
   const r = await clmm.makeSwapBaseInInstructions({
     connection,
@@ -215,14 +144,9 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
     poolId,
     diag: {
       version: VERSION,
-      poolType: apiPool?.type,
-      poolProgramId: apiPool?.programId,
-      poolKeysVariant,
-      poolKeysAttempts,
-      poolInfoKeys: Object.keys(poolInfo || {}),
-      poolKeysKeys: Object.keys(poolKeys || {}),
-      sdkKeysCount: Object.keys(sdk || {}).length,
-      sdkTopKeysCount: Object.keys(mod || {}).length,
+      note: "bypassed fetchMultiplePoolInfos; used PoolInfoLayout.decode",
+      decodedKeysCount: decodedKeys.length,
+      decodedPubkeys: pubkeys,
     },
   };
 }
@@ -235,22 +159,9 @@ app.get("/try-fetch", async (_req, res) => {
     rateLimit();
     const { sdk } = await loadSdk();
     const apiPool = await fetchBestPool();
-    const clmm = sdk.Clmm;
-
-    const out = { ok: true, version: VERSION, poolId: apiPool.id, poolType: apiPool.type, poolProgramId: apiPool.programId };
-    out.hasJsonInfo2PoolKeys = !!findJsonInfo2PoolKeys(sdk);
-
-    const { poolKeys, used, attempts } = await jsonInfoToPoolKeys(sdk, apiPool);
-    out.poolKeysVariant = used;
-    out.poolKeysAttempts = attempts;
-    out.poolKeysKeys = Object.keys(poolKeys || {});
-
     const poolId = new PublicKey(apiPool.id);
-    const fetchTry = await tryFetchWithPoolKeys(clmm, poolId, poolKeys);
-    out.fetchTry = fetchTry;
-    out.fetchOk = fetchTry.ok;
-
-    res.json(out);
+    const decoded = await decodeClmmPoolState(sdk, poolId);
+    res.json({ ok: true, version: VERSION, poolId: poolId.toBase58(), poolType: apiPool.type, poolProgramId: apiPool.programId, decoded });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -262,16 +173,15 @@ app.post("/build-tx", async (req, res) => {
     const { userPublicKey, mode, amountIn, minAmountOut } = req.body || {};
     if (!userPublicKey) throw new Error("Missing userPublicKey");
     const user = new PublicKey(userPublicKey);
-
-    const tx = new Transaction();
-    tx.feePayer = user;
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
-
-    if ((mode || "") !== "clmm_swap") throw new Error("Only mode=clmm_swap supported in fix9");
+    if ((mode || "") !== "clmm_swap") throw new Error("Only mode=clmm_swap supported in fix10");
 
     const ain = Number(amountIn ?? 0);
     if (!ain || ain <= 0) throw new Error("amountIn must be > 0 (USDC base units)");
     const mout = Number(minAmountOut ?? 0);
+
+    const tx = new Transaction();
+    tx.feePayer = user;
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
 
     const { usdcAta, wsolAta } = deriveAtas(user);
     const createUsdc = await ensureAtaIx(user, usdcAta, USDC_MINT);
