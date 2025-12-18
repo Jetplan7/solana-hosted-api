@@ -1,13 +1,9 @@
-# CLMM auto-ATA fix4 (stops using poolKeys:{id})
+# CLMM auto-ATA fix5
 
-Your last error shows the server is STILL attempting:
-  fetchMultiplePoolInfos(poolKeys:{id})
-which triggers "_bn" error on your instance.
-
-This build removes that variant entirely and adds:
-- GET /version to prove which code is deployed
-- /health now returns {version: "..."} too
+Adds /try-fetch endpoint to discover the correct parameter shape for:
+Clmm.fetchMultiplePoolInfos on your specific Raydium SDK build.
 
 After deploy:
-- Open /version and confirm "1.4.5-fix4"
-- Then retry POST /build-tx
+- Open /version (should be 1.4.6-fix5)
+- Open /try-fetch and paste the JSON here (it tells us which variant works)
+- Then /build-tx will use the working variant automatically.
