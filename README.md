@@ -1,9 +1,8 @@
-# CLMM auto-ATA + diagnostics build
+# CLMM auto-ATA diag v2
 
-This build improves CLMM swap building by attempting to fetch full pool info from RPC before building swap,
-and returns rich diagnostics if it still fails.
+Fixes two issues:
+- Raydium SDK sometimes exports everything under `default` when imported as ESM
+- CLMM fetchers accept different parameter shapes; we try multiple conventions
 
-Endpoints:
-- GET /clmm-methods
-- GET /derive/:wallet
-- POST /build-tx (mode=clmm_swap)
+New endpoint:
+- GET /sdk-shape  -> shows actual SDK shape on Render (top-level vs default), and Clmm methods list
