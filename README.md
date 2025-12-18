@@ -1,30 +1,23 @@
-# Raydium SOL/USDC is returning CLMM (Concentrated)
+# CLMM swap backend with AUTO token-account discovery + auto-create
 
-Your Raydium API response shows:
-- type: "Concentrated"
-- programId: CAMMC...
+This backend removes the need to manually paste token accounts.
 
-That means the pool is **Raydium CLMM**, not AMM v4.
-AMM v4 swap builders need OpenBook market accounts; CLMM does not use them.
+- It derives your USDC ATA + wSOL ATA from your wallet pubkey.
+- If either ATA does not exist, it adds create-ATA instructions.
+  (Requires a small amount of SOL to pay rent once.)
 
-This build:
-- Adds /raydium-raw so you can see the raw pool object
-- Adds /raydium-sdk-exports so we can patch SDK function names if needed
-- Supports POST /build-tx with mode=clmm_swap (swap-only) using best-effort CLMM builders
-
-## Configure
-POST /config:
-{
-  "user": {
-    "userSourceTokenAccount": "<YOUR USDC ATA>",
-    "userDestinationTokenAccount": "<YOUR wSOL ATA>"
-  },
-  "settings": { "cuLimit": 1600000, "cuPriceMicroLamports": 80000, "requireSimulation": true }
-}
-
-## Test
+Endpoints:
 - GET /health
-- GET /raydium-raw
-- POST /build-tx: { userPublicKey, mode:"clmm_swap", amountIn:1000000, minAmountOut:0 }
+- GET /derive/:wallet           -> shows derived ATAs + existence
+- GET /raydium-raw              -> shows best SOL/USDC pool (often CLMM)
+- GET /raydium-sdk-exports      -> debug which Raydium SDK funcs exist
+- POST /build-tx                -> mode=clmm_swap builds a tx (unsigned) + simulates
 
-If build fails, open /raydium-sdk-exports and paste the exports list + the error.
+Build tx example:
+POST /build-tx
+{
+  "userPublicKey": "<YOUR_WALLET>",
+  "mode": "clmm_swap",
+  "amountIn": 1000000,
+  "minAmountOut": 0
+}
