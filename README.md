@@ -1,9 +1,16 @@
-# CLMM auto-ATA fix5
+# CLMM auto-ATA fix6
 
-Adds /try-fetch endpoint to discover the correct parameter shape for:
-Clmm.fetchMultiplePoolInfos on your specific Raydium SDK build.
+Your /try-fetch showed:
+- fetchMultiplePoolInfos expects `poolKeys` (it does poolKeys.map internally)
+- Our earlier poolKeys were the wrong shape, causing `_bn` errors
+
+This build uses Raydium SDK's `jsonInfo2PoolKeys(apiPool)` to convert the Raydium API pool JSON into the
+correct `poolKeys` struct (PublicKeys, BN values, etc).
+
+Then it calls:
+  Clmm.fetchMultiplePoolInfos({ poolKeys: [poolKeys] })
 
 After deploy:
-- Open /version (should be 1.4.6-fix5)
-- Open /try-fetch and paste the JSON here (it tells us which variant works)
-- Then /build-tx will use the working variant automatically.
+- GET /version => 1.4.7-fix6
+- GET /try-fetch => fetchOk should be true
+- POST /build-tx => should return ok:true + base64 tx

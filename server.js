@@ -5,7 +5,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction 
 
 dotenv.config();
 
-const VERSION = "1.4.6-fix5";
+const VERSION = "1.4.7-fix6";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -64,80 +64,86 @@ async function loadSdk() {
   return { mod, sdk };
 }
 
-async function tryFetchPoolInfo(clmm, poolId, poolApiObj) {
-  const idStr = poolId.toBase58();
-  const attempts = [
-    { name: "poolIds:[string]", args: { connection, poolIds: [idStr] } },
-    { name: "poolIds:[PublicKey]", args: { connection, poolIds: [poolId] } },
-    { name: "poolKeys:[string]", args: { connection, poolKeys: [idStr] } },
-    { name: "poolKeys:[PublicKey]", args: { connection, poolKeys: [poolId] } },
-    { name: "poolKeys:[{id:string}]", args: { connection, poolKeys: [{ id: idStr }] } },
-    { name: "poolKeys:[{id:PublicKey}]", args: { connection, poolKeys: [{ id: poolId }] } },
-    { name: "poolKeys:[apiPoolObj]", args: { connection, poolKeys: [poolApiObj] } },
-  ];
-
-  const results = [];
-  for (const a of attempts) {
-    try {
-      const res = await clmm.fetchMultiplePoolInfos(a.args);
-      const byId = res?.[idStr];
-      const first = res?.poolInfos?.[0] || res?.infos?.[0] || res?.[0] || null;
-      const poolInfo = byId || first || null;
-      results.push({ name: a.name, ok: !!poolInfo, resShape: Object.keys(res || {}), poolInfoKeys: poolInfo ? Object.keys(poolInfo) : null });
-      if (poolInfo) return { poolInfo, fetcherTried: a.name, attemptResults: results };
-    } catch (e) {
-      results.push({ name: a.name, ok: false, error: e?.message || String(e) });
-    }
+function safeJsonInfo2PoolKeys(sdk, apiPool) {
+  // Raydium SDK expects a "json pool info" object and converts strings -> PublicKeys etc.
+  // This is the missing step that caused _bn errors.
+  if (typeof sdk.jsonInfo2PoolKeys === "function") {
+    return sdk.jsonInfo2PoolKeys(apiPool);
   }
-  return { poolInfo: null, fetcherTried: null, attemptResults: results };
+  if (sdk.PoolUtils?.jsonInfo2PoolKeys) {
+    return sdk.PoolUtils.jsonInfo2PoolKeys(apiPool);
+  }
+  throw new Error("jsonInfo2PoolKeys not found in Raydium SDK exports.");
+}
+
+async function fetchClmmPoolInfo(clmm, sdk, apiPool) {
+  const poolId = new PublicKey(apiPool.id);
+  const poolKeys = safeJsonInfo2PoolKeys(sdk, apiPool);
+
+  // The CLMM fetcher in your build uses poolKeys.map(...) so poolKeys must be provided.
+  const res = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
+
+  const byId = res?.[poolId.toBase58()];
+  const first = res?.poolInfos?.[0] || res?.infos?.[0] || res?.[0] || null;
+  const poolInfo = byId || first || null;
+  if (!poolInfo) {
+    throw new Error("fetchMultiplePoolInfos returned no poolInfo. resKeys=" + JSON.stringify(Object.keys(res || {})));
+  }
+  return { poolId, poolKeys, poolInfo };
 }
 
 async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
   const { mod, sdk } = await loadSdk();
-  const pool = await fetchBestPool();
-  const poolId = new PublicKey(pool.id);
-  const { usdcAta, wsolAta } = deriveAtas(owner);
+  const apiPool = await fetchBestPool();
 
   const clmm = sdk?.Clmm;
-  const clmmMethods = clmm ? Object.getOwnPropertyNames(clmm).sort() : [];
   if (!clmm) throw new Error("Raydium SDK Clmm missing.");
+  if (!clmm.fetchMultiplePoolInfos) throw new Error("Clmm.fetchMultiplePoolInfos missing.");
+  if (!clmm.makeSwapBaseInInstructions) throw new Error("Clmm.makeSwapBaseInInstructions missing.");
 
-  const fetched = await tryFetchPoolInfo(clmm, poolId, pool);
-  const poolInfo = fetched.poolInfo;
+  const { poolId, poolKeys, poolInfo } = await fetchClmmPoolInfo(clmm, sdk, apiPool);
 
-  let lastErr = null;
+  const { usdcAta, wsolAta } = deriveAtas(owner);
+
+  // Best effort: prefetch tick arrays (some versions do it internally, but this helps)
+  let tickDiag = null;
   try {
-    const r = await clmm.makeSwapBaseInInstructions({
-      connection,
-      poolInfo: poolInfo || { id: poolId },
-      ownerInfo: { wallet: owner, tokenAccountIn: usdcAta, tokenAccountOut: wsolAta },
-      amountIn: BigInt(amountIn),
-      amountOutMin: BigInt(minAmountOut),
-    });
-    const inner = r?.innerTransactions || [];
-    const ixs = inner.flatMap(t => t.instructions || []);
-    const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
-    if (!finalIxs.length) throw new Error("swap builder returned no instructions");
-    return { ixs: finalIxs, poolId, usdcAta, wsolAta, diag: { version: VERSION, fetcherTried: fetched.fetcherTried, poolInfoKeys: poolInfo ? Object.keys(poolInfo) : null } };
+    if (clmm.fetchMultiplePoolTickArrays) {
+      const tick = await clmm.fetchMultiplePoolTickArrays({ connection, poolInfos: [poolInfo] });
+      tickDiag = { ok: true, keys: Object.keys(tick || {}) };
+    }
   } catch (e) {
-    lastErr = e;
+    tickDiag = { ok: false, error: e?.message || String(e) };
   }
 
-  const diag = {
-    version: VERSION,
-    poolType: pool?.type,
-    poolProgramId: pool?.programId,
-    poolId: poolId.toBase58(),
-    hasClmm: !!clmm,
-    clmmMethods,
-    sdkTopKeysCount: Object.keys(mod).length,
-    sdkKeysCount: Object.keys(sdk || {}).length,
-    fetcherTried: fetched.fetcherTried,
-    fetchAttempts: fetched.attemptResults,
-    poolInfoKeys: poolInfo ? Object.keys(poolInfo) : null,
-    lastError: lastErr?.message || String(lastErr),
+  const r = await clmm.makeSwapBaseInInstructions({
+    connection,
+    poolInfo,
+    poolKeys,
+    ownerInfo: { wallet: owner, tokenAccountIn: usdcAta, tokenAccountOut: wsolAta },
+    amountIn: BigInt(amountIn),
+    amountOutMin: BigInt(minAmountOut),
+  });
+
+  const inner = r?.innerTransactions || [];
+  const ixs = inner.flatMap(t => t.instructions || []);
+  const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
+  if (!finalIxs.length) throw new Error("swap builder returned no instructions");
+
+  return {
+    ixs: finalIxs,
+    poolId,
+    diag: {
+      version: VERSION,
+      poolType: apiPool?.type,
+      poolProgramId: apiPool?.programId,
+      poolInfoKeys: Object.keys(poolInfo || {}),
+      poolKeysKeys: Object.keys(poolKeys || {}),
+      tickDiag,
+      sdkKeysCount: Object.keys(sdk || {}).length,
+      sdkTopKeysCount: Object.keys(mod || {}).length,
+    },
   };
-  throw new Error("CLMM swap build failed: " + JSON.stringify(diag, null, 2));
 }
 
 /* Routes */
@@ -163,11 +169,24 @@ app.get("/raydium-raw", async (_req, res) => {
   }
 });
 
-app.get("/clmm-methods", async (_req, res) => {
+app.get("/try-fetch", async (_req, res) => {
   try {
     rateLimit();
     const { sdk } = await loadSdk();
-    res.json({ ok: true, version: VERSION, hasClmm: !!sdk?.Clmm, clmmMethods: sdk?.Clmm ? Object.getOwnPropertyNames(sdk.Clmm).sort() : [] });
+    const apiPool = await fetchBestPool();
+    const clmm = sdk.Clmm;
+    const poolKeys = safeJsonInfo2PoolKeys(sdk, apiPool);
+    const out = { ok: true, version: VERSION, hasJsonInfo2PoolKeys: true, poolId: apiPool.id, poolKeysKeys: Object.keys(poolKeys || {}) };
+    try {
+      const r = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolKeys] });
+      out.fetchOk = true;
+      out.resKeys = Object.keys(r || {});
+      out.byId = !!r?.[apiPool.id];
+    } catch (e) {
+      out.fetchOk = false;
+      out.fetchError = e?.message || String(e);
+    }
+    res.json(out);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -186,19 +205,6 @@ app.get("/derive/:wallet", async (req, res) => {
   }
 });
 
-app.get("/try-fetch", async (_req, res) => {
-  try {
-    rateLimit();
-    const { sdk } = await loadSdk();
-    const pool = await fetchBestPool();
-    const poolId = new PublicKey(pool.id);
-    const fetched = await tryFetchPoolInfo(sdk.Clmm, poolId, pool);
-    res.json({ ok: true, version: VERSION, poolId: poolId.toBase58(), fetcherTried: fetched.fetcherTried, attempts: fetched.attemptResults });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 app.post("/build-tx", async (req, res) => {
   try {
     rateLimit();
@@ -208,12 +214,13 @@ app.post("/build-tx", async (req, res) => {
 
     const tx = new Transaction();
     tx.feePayer = user;
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
+    tx.add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }),
+    );
 
     const m = mode || "noop";
-    if (m === "noop") {
-      tx.add(new TransactionInstruction({ programId: new PublicKey("11111111111111111111111111111111"), keys: [], data: Buffer.alloc(0) }));
-    } else if (m === "clmm_swap") {
+    if (m === "clmm_swap") {
       const ain = Number(amountIn ?? 0);
       if (!ain || ain <= 0) throw new Error("amountIn must be > 0 (USDC base units)");
       const mout = Number(minAmountOut ?? 0);
@@ -232,15 +239,23 @@ app.post("/build-tx", async (req, res) => {
 
       await simulateOrThrow(tx);
 
-      return res.json({ ok: true, version: VERSION, note: m, pool: built.poolId.toBase58(), atas: { usdcAta: built.usdcAta.toBase58(), wsolAta: built.wsolAta.toBase58() }, diag: built.diag, tx: tx.serialize({ requireAllSignatures: false }).toString("base64") });
-    } else {
-      throw new Error("Unknown mode. Use noop or clmm_swap.");
+      return res.json({
+        ok: true,
+        version: VERSION,
+        note: m,
+        pool: built.poolId.toBase58(),
+        atas: { usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58() },
+        diag: built.diag,
+        tx: tx.serialize({ requireAllSignatures: false }).toString("base64"),
+      });
     }
 
+    // noop
+    tx.add(new TransactionInstruction({ programId: new PublicKey("11111111111111111111111111111111"), keys: [], data: Buffer.alloc(0) }));
     const { blockhash } = await connection.getLatestBlockhash();
     tx.recentBlockhash = blockhash;
     await simulateOrThrow(tx);
-    res.json({ ok: true, version: VERSION, note: m, tx: tx.serialize({ requireAllSignatures: false }).toString("base64") });
+    res.json({ ok: true, version: VERSION, note: "noop", tx: tx.serialize({ requireAllSignatures: false }).toString("base64") });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
