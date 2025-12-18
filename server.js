@@ -1,16 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
-import {
-  Connection,
-  PublicKey,
-  Transaction,
-  TransactionInstruction,
-  ComputeBudgetProgram,
-} from "@solana/web3.js";
-import {
-  getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction,
-} from "@solana/spl-token";
+import { Connection, PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction } from "@solana/spl-token";
 
 dotenv.config();
 
@@ -23,9 +14,7 @@ const connection = new Connection(RPC, "confirmed");
 
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
-const RAYDIUM_CLMM_PROGRAM_ID  = new PublicKey("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 
-/* ---------- Simple rate limit ---------- */
 let bucket = { ts: Date.now(), n: 0 };
 function rateLimit() {
   const now = Date.now();
@@ -37,13 +26,12 @@ function rateLimit() {
 async function simulateOrThrow(tx) {
   const sim = await connection.simulateTransaction(tx, { replaceRecentBlockhash: true, sigVerify: false });
   if (sim.value.err) {
-    const logs = sim.value.logs?.slice(-40) || [];
-    throw new Error("Simulation failed: " + JSON.stringify(sim.value.err) + "\n" + logs.join("\n"));
+    const logs = sim.value.logs?.slice(-80) || [];
+    throw new Error("Simulation failed: " + JSON.stringify(sim.value.err) + "\\n" + logs.join("\\n"));
   }
   return sim.value.logs || [];
 }
 
-/* ---------- Raydium API: get best SOL/USDC pool (CLMM) ---------- */
 async function fetchBestPool() {
   const url =
     "https://api-v3.raydium.io/pools/info/mint" +
@@ -52,55 +40,83 @@ async function fetchBestPool() {
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`Raydium API HTTP ${res.status}`);
   const json = await res.json();
-  const list =
-    json?.data?.data || json?.data?.list || json?.data || json?.result?.data || json?.result || [];
+  const list = json?.data?.data || json?.data?.list || json?.data || json?.result?.data || json?.result || [];
   if (!Array.isArray(list) || !list.length) throw new Error("No pools returned");
   return list[0];
 }
 
-/* ---------- ATA derivation + auto-create ---------- */
 function deriveAtas(owner) {
-  const usdcAta = getAssociatedTokenAddressSync(USDC_MINT, owner, false);
-  const wsolAta = getAssociatedTokenAddressSync(WSOL_MINT, owner, false);
-  return { usdcAta, wsolAta };
+  return {
+    usdcAta: getAssociatedTokenAddressSync(USDC_MINT, owner, false),
+    wsolAta: getAssociatedTokenAddressSync(WSOL_MINT, owner, false),
+  };
 }
-
 async function ensureAtaIx(payerOwner, ata, mint) {
   const info = await connection.getAccountInfo(ata);
-  if (info) return null; // exists
-  // payerOwner signs and pays rent
-  return createAssociatedTokenAccountInstruction(
-    payerOwner, // payer
-    ata,        // ata
-    payerOwner, // owner
-    mint
-  );
+  if (info) return null;
+  return createAssociatedTokenAccountInstruction(payerOwner, ata, payerOwner, mint);
 }
 
-/* ---------- CLMM swap builder (best-effort via installed raydium-sdk) ---------- */
 async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
   const sdk = await import("@raydium-io/raydium-sdk");
   const pool = await fetchBestPool();
-
-  if (!pool?.type || String(pool.type).toLowerCase() !== "concentrated") {
-    throw new Error("Raydium best pool is not CLMM right now.");
-  }
-  if (pool?.programId && pool.programId !== RAYDIUM_CLMM_PROGRAM_ID.toBase58()) {
-    // still allow, but warn in logs
-    console.log("Warning: pool programId differs:", pool.programId);
-  }
-
   const poolId = new PublicKey(pool.id);
   const { usdcAta, wsolAta } = deriveAtas(owner);
 
-  // We attempt a few known CLMM builders depending on SDK version.
+  const clmm = sdk.Clmm;
+  const methods = clmm ? Object.keys(clmm).sort() : [];
+
+  // Try to fetch full on-chain pool info first (version-dependent)
+  let poolInfo = null;
+  let extra = {};
+  const tryFetchers = [];
+
+  if (clmm?.fetchMultiplePoolInfos) {
+    tryFetchers.push(async () => {
+      const r = await clmm.fetchMultiplePoolInfos({ connection, poolKeys: [poolId] });
+      poolInfo = r?.[poolId.toBase58()] || r?.poolInfos?.[0] || r?.infos?.[0] || r?.[0] || null;
+      extra.fetcher = "fetchMultiplePoolInfos";
+    });
+  }
+  if (clmm?.fetchPoolInfos) {
+    tryFetchers.push(async () => {
+      const r = await clmm.fetchPoolInfos({ connection, poolKeys: [poolId] });
+      poolInfo = r?.[poolId.toBase58()] || r?.poolInfos?.[0] || r?.infos?.[0] || r?.[0] || null;
+      extra.fetcher = "fetchPoolInfos";
+    });
+  }
+  if (clmm?.fetchPoolInfo) {
+    tryFetchers.push(async () => {
+      const r = await clmm.fetchPoolInfo({ connection, poolId });
+      poolInfo = r?.poolInfo || r?.info || r || null;
+      extra.fetcher = "fetchPoolInfo";
+    });
+  }
+  if (clmm?.getPoolInfoFromRpc) {
+    tryFetchers.push(async () => {
+      const r = await clmm.getPoolInfoFromRpc({ connection, poolId });
+      poolInfo = r?.poolInfo || r?.info || r || null;
+      extra.fetcher = "getPoolInfoFromRpc";
+    });
+  }
+
+  let lastFetchErr = null;
+  for (const f of tryFetchers) {
+    try {
+      await f();
+      if (poolInfo) break;
+    } catch (e) {
+      lastFetchErr = e;
+    }
+  }
+
   const attempts = [];
 
-  if (sdk.Clmm?.makeSwapInstructionSimple) {
+  if (clmm?.makeSwapInstructionSimple) {
     attempts.push(async () => {
-      const r = await sdk.Clmm.makeSwapInstructionSimple({
+      const r = await clmm.makeSwapInstructionSimple({
         connection,
-        poolInfo: { id: poolId },
+        poolInfo: poolInfo || { id: poolId },
         ownerInfo: { wallet: owner, tokenAccountIn: usdcAta, tokenAccountOut: wsolAta },
         amountIn: BigInt(amountIn),
         minAmountOut: BigInt(minAmountOut),
@@ -113,11 +129,11 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
     });
   }
 
-  if (sdk.Clmm?.makeSwapBaseInInstructions) {
+  if (clmm?.makeSwapBaseInInstructions) {
     attempts.push(async () => {
-      const r = await sdk.Clmm.makeSwapBaseInInstructions({
+      const r = await clmm.makeSwapBaseInInstructions({
         connection,
-        poolInfo: { id: poolId },
+        poolInfo: poolInfo || { id: poolId },
         ownerInfo: { wallet: owner, tokenAccountIn: usdcAta, tokenAccountOut: wsolAta },
         amountIn: BigInt(amountIn),
         amountOutMin: BigInt(minAmountOut),
@@ -130,35 +146,29 @@ async function buildClmmSwapIxs({ owner, amountIn, minAmountOut }) {
     });
   }
 
-  if (sdk.swapInstruction) {
-    // generic swapInstruction exists; try a minimal call if supported by this build
-    attempts.push(async () => {
-      // This is highly version-dependent; may throw. Kept as a fallback.
-      const ix = await sdk.swapInstruction({
-        poolId,
-        owner,
-        tokenAccountIn: usdcAta,
-        tokenAccountOut: wsolAta,
-        amountIn: BigInt(amountIn),
-        minAmountOut: BigInt(minAmountOut),
-      });
-      return ix ? [ix] : [];
-    });
-  }
-
   let lastErr = null;
   for (const fn of attempts) {
     try {
       const ixs = await fn();
-      if (ixs && ixs.length) return { ixs, poolId, usdcAta, wsolAta };
+      if (ixs && ixs.length) return { ixs, poolId, usdcAta, wsolAta, extra: { ...extra, clmmMethods: methods } };
     } catch (e) {
       lastErr = e;
     }
   }
-  throw new Error("CLMM swap build failed: " + (lastErr?.message || String(lastErr)));
+
+  const diag = {
+    poolType: pool?.type,
+    poolProgramId: pool?.programId,
+    poolId: poolId.toBase58(),
+    fetcherTried: extra.fetcher || null,
+    fetchError: lastFetchErr?.message || null,
+    poolInfoKeys: poolInfo ? Object.keys(poolInfo) : null,
+    clmmMethods: methods,
+    lastError: lastErr?.message || String(lastErr),
+  };
+  throw new Error("CLMM swap build failed: " + JSON.stringify(diag, null, 2));
 }
 
-/* ---------- Routes ---------- */
 app.get("/health", async (_req, res) => {
   try {
     rateLimit();
@@ -176,17 +186,7 @@ app.get("/derive/:wallet", async (req, res) => {
     const { usdcAta, wsolAta } = deriveAtas(owner);
     const usdcExists = !!(await connection.getAccountInfo(usdcAta));
     const wsolExists = !!(await connection.getAccountInfo(wsolAta));
-    res.json({
-      ok: true,
-      wallet: owner.toBase58(),
-      usdcMint: USDC_MINT.toBase58(),
-      wsolMint: WSOL_MINT.toBase58(),
-      usdcAta: usdcAta.toBase58(),
-      wsolAta: wsolAta.toBase58(),
-      usdcAtaExists: usdcExists,
-      wsolAtaExists: wsolExists,
-      note: "If an ATA does not exist, /build-tx will include a create-ATA instruction (requires a small SOL rent payment).",
-    });
+    res.json({ ok: true, wallet: owner.toBase58(), usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58(), usdcAtaExists: usdcExists, wsolAtaExists: wsolExists });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -202,24 +202,16 @@ app.get("/raydium-raw", async (_req, res) => {
   }
 });
 
-app.get("/raydium-sdk-exports", async (_req, res) => {
+app.get("/clmm-methods", async (_req, res) => {
   try {
     rateLimit();
     const sdk = await import("@raydium-io/raydium-sdk");
-    res.json({ ok: true, exports: Object.keys(sdk).sort() });
+    res.json({ ok: true, clmmMethods: sdk.Clmm ? Object.keys(sdk.Clmm).sort() : [], hasMakeSwapInstructionSimple: !!sdk.Clmm?.makeSwapInstructionSimple, hasMakeSwapBaseInInstructions: !!sdk.Clmm?.makeSwapBaseInInstructions });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-/**
- * POST /build-tx
- * body:
- *  - userPublicKey: string
- *  - mode: "noop" | "clmm_swap"
- *  - amountIn: number (USDC base units; 1 USDC = 1_000_000)
- *  - minAmountOut: number (wSOL base units; 1 SOL = 1_000_000_000)
- */
 app.post("/build-tx", async (req, res) => {
   try {
     rateLimit();
@@ -229,10 +221,7 @@ app.post("/build-tx", async (req, res) => {
 
     const tx = new Transaction();
     tx.feePayer = user;
-    tx.add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }),
-    );
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
 
     const m = mode || "noop";
     if (m === "noop") {
@@ -242,19 +231,17 @@ app.post("/build-tx", async (req, res) => {
       if (!ain || ain <= 0) throw new Error("amountIn must be > 0 (USDC base units)");
       const mout = Number(minAmountOut ?? 0);
 
-      // Ensure ATAs (auto-derive from wallet)
       const { usdcAta, wsolAta } = deriveAtas(user);
       const createUsdc = await ensureAtaIx(user, usdcAta, USDC_MINT);
       const createWsol = await ensureAtaIx(user, wsolAta, WSOL_MINT);
       if (createUsdc) tx.add(createUsdc);
       if (createWsol) tx.add(createWsol);
 
-      // Build CLMM swap (USDC -> wSOL)
       const built = await buildClmmSwapIxs({ owner: user, amountIn: ain, minAmountOut: mout });
       for (const ix of built.ixs) tx.add(ix);
-
-      tx.__atas = { usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58() };
       tx.__pool = built.poolId.toBase58();
+      tx.__diag = built.extra || {};
+      tx.__atas = { usdcAta: usdcAta.toBase58(), wsolAta: wsolAta.toBase58() };
     } else {
       throw new Error("Unknown mode. Use noop or clmm_swap.");
     }
@@ -264,20 +251,13 @@ app.post("/build-tx", async (req, res) => {
 
     await simulateOrThrow(tx);
 
-    res.json({
-      ok: true,
-      note: m,
-      pool: tx.__pool,
-      atas: tx.__atas,
-      tx: tx.serialize({ requireAllSignatures: false }).toString("base64"),
-      tip: "If you have very low SOL, create-ATA instructions may fail due to rent. You only need a small amount of SOL once.",
-    });
+    res.json({ ok: true, note: m, pool: tx.__pool, atas: tx.__atas, diag: tx.__diag, tx: tx.serialize({ requireAllSignatures: false }).toString("base64") });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Render API (CLMM auto-ATA) listening on 0.0.0.0:${PORT}`);
+  console.log(`Render API (CLMM auto-ATA diag) listening on 0.0.0.0:${PORT}`);
   console.log(`RPC: ${RPC}`);
 });
