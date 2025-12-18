@@ -1,20 +1,30 @@
-# Fix: Raydium auto-pool was picking CLMM (Concentrated)
+# Raydium SOL/USDC is returning CLMM (Concentrated)
 
-Your /raydium-raw output shows:
+Your Raydium API response shows:
 - type: "Concentrated"
-- programId: CAMMC... (Raydium CLMM)
+- programId: CAMMC...
 
-But the Raydium `Liquidity.makeSwapInstructionSimple` builder is for AMM v4 pools,
-which have OpenBook market fields like marketId/marketBids/etc.
+That means the pool is **Raydium CLMM**, not AMM v4.
+AMM v4 swap builders need OpenBook market accounts; CLMM does not use them.
 
 This build:
-- fetches multiple pools from Raydium API
-- filters out CLMM
-- picks the best compatible AMM v4 pool
-- supports mode=raydium_swap (swap-only) to confirm pool selection works
+- Adds /raydium-raw so you can see the raw pool object
+- Adds /raydium-sdk-exports so we can patch SDK function names if needed
+- Supports POST /build-tx with mode=clmm_swap (swap-only) using best-effort CLMM builders
 
-## After deploy
-- GET /raydium-pool  -> should return a pool object with fields authority/openOrders/marketId/etc (not "Concentrated")
-- POST /build-tx with mode=raydium_swap to confirm instruction building works.
+## Configure
+POST /config:
+{
+  "user": {
+    "userSourceTokenAccount": "<YOUR USDC ATA>",
+    "userDestinationTokenAccount": "<YOUR wSOL ATA>"
+  },
+  "settings": { "cuLimit": 1600000, "cuPriceMicroLamports": 80000, "requireSimulation": true }
+}
 
-Once swap-only works, we re-enable the Solend flashloan path on top.
+## Test
+- GET /health
+- GET /raydium-raw
+- POST /build-tx: { userPublicKey, mode:"clmm_swap", amountIn:1000000, minAmountOut:0 }
+
+If build fails, open /raydium-sdk-exports and paste the exports list + the error.
