@@ -1,6 +1,6 @@
 {
   "name": "solana-render-api-usdc-raydium-autopool",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,6 +15,6 @@
     "@solana/web3.js": "^1.95.4",
     "@solana/spl-token": "^0.4.9",
     "@solendprotocol/solend-sdk": "^0.6.14",
-    "@raydium-io/raydium-sdk": "^1.3.1"
+    "@raydium-io/raydium-sdk": "*"
   }
 }
