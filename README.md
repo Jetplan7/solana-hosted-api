@@ -1,8 +1,13 @@
-# CLMM auto-ATA diag v2
+# CLMM auto-ATA fix4 (stops using poolKeys:{id})
 
-Fixes two issues:
-- Raydium SDK sometimes exports everything under `default` when imported as ESM
-- CLMM fetchers accept different parameter shapes; we try multiple conventions
+Your last error shows the server is STILL attempting:
+  fetchMultiplePoolInfos(poolKeys:{id})
+which triggers "_bn" error on your instance.
 
-New endpoint:
-- GET /sdk-shape  -> shows actual SDK shape on Render (top-level vs default), and Clmm methods list
+This build removes that variant entirely and adds:
+- GET /version to prove which code is deployed
+- /health now returns {version: "..."} too
+
+After deploy:
+- Open /version and confirm "1.4.5-fix4"
+- Then retry POST /build-tx
