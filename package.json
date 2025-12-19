@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix22-amm-json-source",
-  "version": "1.6.4",
+  "name": "solana-render-api-fix23-robust-timeouts",
+  "version": "1.6.5",
   "private": true,
   "engines": {
     "node": ">=18"
