@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix18-guard-closewsol-debug",
-  "version": "1.6.0",
+  "name": "solana-render-api-fix19-clmm-poolkeys-full",
+  "version": "1.6.1",
   "private": true,
   "engines": {
     "node": ">=18"

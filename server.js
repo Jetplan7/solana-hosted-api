@@ -11,7 +11,7 @@ const {
 
 dotenv.config();
 
-const VERSION = "1.6.0-fix18-guard-closewsol-debug";
+const VERSION = "1.6.1-fix19-clmm-poolkeys-full";
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
@@ -43,18 +43,15 @@ function deriveAtas(owner){
     wsolAta: getAssociatedTokenAddressSync(WSOL_MINT, owner, false),
   };
 }
-
 async function ensureAtaIx(payerOwner, ata, mint){
   const info = await connection.getAccountInfo(ata);
   if (info) return null;
   return createAssociatedTokenAccountInstruction(payerOwner, ata, payerOwner, mint);
 }
-
 function addCompute(tx){
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }));
   tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
 }
-
 async function simulateOrThrow(tx){
   const sim = await connection.simulateTransaction(tx, { replaceRecentBlockhash: true, sigVerify: false });
   if (sim.value.err) {
@@ -63,7 +60,6 @@ async function simulateOrThrow(tx){
   }
   return sim.value.logs || [];
 }
-
 async function finalizeTx(tx, feePayer, doSimulate){
   tx.feePayer = feePayer;
   const { blockhash } = await connection.getLatestBlockhash();
@@ -107,6 +103,12 @@ async function decodeClmmPoolState(sdk, poolId){
   return sdk.PoolInfoLayout.decode(acc.data);
 }
 
+function pickPkField(obj, key) {
+  const v = obj?.[key];
+  const p = pk(v);
+  return p || null;
+}
+
 function describePk(v){
   if (!v) return { ok:false, reason:"undefined/null" };
   try {
@@ -125,62 +127,104 @@ async function buildClmmSwapIxs({ owner, amountInLamports, minAmountOutUsdc }){
 
   const poolId = new PublicKey(apiPool.id);
   const decoded = await decodeClmmPoolState(sdk, poolId);
-  const { usdcAta, wsolAta } = deriveAtas(owner);
 
+  const { usdcAta, wsolAta } = deriveAtas(owner);
   const wsolInfo = await connection.getAccountInfo(wsolAta);
   if (!wsolInfo) throw new Error("WSOL ATA does not exist yet. Run setup first.");
 
-  const poolInfo = { ...decoded, id: poolId, programId: new PublicKey(apiPool.programId) };
-  for (const k of ["ammConfig","mintA","mintB","vaultA","vaultB","observationId"]) {
-    const p = pk(poolInfo[k]);
-    if (p) poolInfo[k] = p;
-  }
-  const poolKeys = { id: poolId, programId: poolInfo.programId };
+  // Normalize pubkeys in poolInfo
+  const poolInfo = { ...decoded };
+  poolInfo.id = poolId;
+  poolInfo.programId = new PublicKey(apiPool.programId);
 
-  if (!sdk.Clmm?.makeSwapBaseInInstructions) throw new Error("Clmm.makeSwapBaseInInstructions missing");
+  const ammConfig = pickPkField(poolInfo, "ammConfig") || pickPkField(poolInfo, "ammConfigId") || null;
+  const mintA = pickPkField(poolInfo, "mintA") || null;
+  const mintB = pickPkField(poolInfo, "mintB") || null;
+  const vaultA = pickPkField(poolInfo, "vaultA") || null;
+  const vaultB = pickPkField(poolInfo, "vaultB") || null;
+  const observationId = pickPkField(poolInfo, "observationId") || null;
+  const tickArrayBitmap = pickPkField(poolInfo, "tickArrayBitmap") || null;
 
+  if (ammConfig) poolInfo.ammConfig = ammConfig;
+  if (mintA) poolInfo.mintA = mintA;
+  if (mintB) poolInfo.mintB = mintB;
+  if (vaultA) poolInfo.vaultA = vaultA;
+  if (vaultB) poolInfo.vaultB = vaultB;
+  if (observationId) poolInfo.observationId = observationId;
+  if (tickArrayBitmap) poolInfo.tickArrayBitmap = tickArrayBitmap;
+
+  // Build a "full" poolKeys object CLMM builders expect
+  const poolKeys = {
+    id: poolId,
+    programId: poolInfo.programId,
+    ammConfigId: ammConfig || undefined,
+    mintA: mintA || undefined,
+    mintB: mintB || undefined,
+    vaultA: vaultA || undefined,
+    vaultB: vaultB || undefined,
+    observationId: observationId || undefined,
+    tickArrayBitmap: tickArrayBitmap || undefined,
+  };
+
+  // Some SDK versions use bitmap extension PDA
   try {
-    const r = await sdk.Clmm.makeSwapBaseInInstructions({
-      connection,
-      poolInfo,
-      poolKeys,
-      ownerInfo: { wallet: owner, tokenAccountIn: wsolAta, tokenAccountOut: usdcAta },
-      amountIn: BigInt(amountInLamports),
-      amountOutMin: BigInt(minAmountOutUsdc),
-    });
+    if (sdk.getPdaExBitmapAccount) {
+      const ex = sdk.getPdaExBitmapAccount(poolId);
+      if (ex?.publicKey) poolKeys.exBitmapAccount = ex.publicKey;
+      else if (ex?.key) poolKeys.exBitmapAccount = ex.key;
+    }
+  } catch {}
 
-    const inner = r?.innerTransactions || [];
-    const ixs = inner.flatMap(t => t.instructions || []);
-    const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
-    if (!finalIxs.length) throw new Error("swap builder returned no instructions");
+  const ownerInfo = { wallet: owner, tokenAccountIn: wsolAta, tokenAccountOut: usdcAta };
+  const amountIn = BigInt(amountInLamports);
+  const amountOutMin = BigInt(minAmountOutUsdc);
 
-    return { ixs: finalIxs, poolId, poolType: apiPool.type, poolProgramId: apiPool.programId, usdcAta, wsolAta };
-  } catch (e) {
-    const diag = {
-      owner: owner.toBase58(),
-      poolId: poolId.toBase58(),
-      poolProgramId: String(apiPool.programId),
-      poolType: String(apiPool.type),
-      poolInfoFields: {
-        programId: describePk(poolInfo.programId),
-        ammConfig: describePk(poolInfo.ammConfig),
-        mintA: describePk(poolInfo.mintA),
-        mintB: describePk(poolInfo.mintB),
-        vaultA: describePk(poolInfo.vaultA),
-        vaultB: describePk(poolInfo.vaultB),
-        observationId: describePk(poolInfo.observationId),
-      },
-      ownerInfo: {
-        tokenAccountIn: wsolAta.toBase58(),
-        tokenAccountOut: usdcAta.toBase58(),
-      },
-      err: String(e?.message || e),
-      hint: "If error mentions '.equals', it usually means a missing PublicKey field. The poolInfoFields above shows which one is undefined."
-    };
-    const wrapped = new Error("Raydium CLMM builder failed: " + JSON.stringify(diag, null, 2));
-    wrapped.cause = e;
-    throw wrapped;
+  // Prefer "Simple" builder if present (usually fewer required fields)
+  const tryFns = [];
+  if (sdk.Clmm?.makeSwapBaseInInstructionSimple) tryFns.push({ name: "makeSwapBaseInInstructionSimple", fn: sdk.Clmm.makeSwapBaseInInstructionSimple });
+  if (sdk.Clmm?.makeSwapBaseInInstructions) tryFns.push({ name: "makeSwapBaseInInstructions", fn: sdk.Clmm.makeSwapBaseInInstructions });
+
+  const attempts = [];
+  for (const t of tryFns) {
+    try {
+      const r = await t.fn({
+        connection,
+        poolInfo,
+        poolKeys,
+        ownerInfo,
+        amountIn,
+        amountOutMin,
+      });
+      const inner = r?.innerTransactions || [];
+      const ixs = inner.flatMap(tx => tx.instructions || []);
+      const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
+      if (!finalIxs.length) throw new Error("builder returned no instructions");
+      return { ixs: finalIxs, poolId, poolType: apiPool.type, poolProgramId: apiPool.programId, usdcAta, wsolAta, builder: t.name, attempts };
+    } catch (e) {
+      attempts.push({ name: t.name, err: String(e?.message || e) });
+    }
   }
+
+  const diag = {
+    owner: owner.toBase58(),
+    poolId: poolId.toBase58(),
+    poolProgramId: String(apiPool.programId),
+    poolType: String(apiPool.type),
+    builderAttempts: attempts,
+    poolKeys: Object.fromEntries(Object.entries(poolKeys).map(([k,v]) => [k, v?.toBase58 ? v.toBase58() : v])),
+    poolInfoFields: {
+      programId: describePk(poolInfo.programId),
+      ammConfig: describePk(poolInfo.ammConfig),
+      tickArrayBitmap: describePk(poolInfo.tickArrayBitmap),
+      mintA: describePk(poolInfo.mintA),
+      mintB: describePk(poolInfo.mintB),
+      vaultA: describePk(poolInfo.vaultA),
+      vaultB: describePk(poolInfo.vaultB),
+      observationId: describePk(poolInfo.observationId),
+    },
+    ownerInfo: { tokenAccountIn: wsolAta.toBase58(), tokenAccountOut: usdcAta.toBase58() },
+  };
+  throw new Error("Raydium CLMM builder failed after poolKeys fill: " + JSON.stringify(diag, null, 2));
 }
 
 // Routes
@@ -241,14 +285,12 @@ app.post("/build-swap-tx", async (req, res) => {
 
     const { usdcAta, wsolAta } = deriveAtas(user);
 
-    // Ensure USDC ATA exists
     const createUsdc = await ensureAtaIx(user, usdcAta, USDC_MINT);
     if (createUsdc) tx.add(createUsdc);
 
     const built = await buildClmmSwapIxs({ owner:user, amountInLamports:Math.trunc(amountInLamports), minAmountOutUsdc:Math.trunc(minAmountOutUsdc) });
     for (const ix of built.ixs) tx.add(ix);
 
-    // Guard close WSOL: only try if the ATA exists AND request is true
     let closeWsolApplied = false;
     if (closeWsolRequested) {
       const wsolInfo = await connection.getAccountInfo(wsolAta);
@@ -259,17 +301,7 @@ app.post("/build-swap-tx", async (req, res) => {
     }
 
     const b64 = await finalizeTx(tx, user, true);
-    res.json({
-      ok:true,
-      version:VERSION,
-      pool: built.poolId.toBase58(),
-      poolType: built.poolType,
-      usdcAta: built.usdcAta.toBase58(),
-      wsolAta: built.wsolAta.toBase58(),
-      closeWsolRequested,
-      closeWsolApplied,
-      tx:b64
-    });
+    res.json({ ok:true, version:VERSION, builder: built.builder, pool:built.poolId.toBase58(), poolType:built.poolType, usdcAta:built.usdcAta.toBase58(), wsolAta:built.wsolAta.toBase58(), closeWsolRequested, closeWsolApplied, tx:b64 });
   } catch (e) {
     res.status(400).json({ ok:false, error:e.message, debug:{ rawBody:req.rawBody||"", jsonError:req.jsonError||null, parsedBody:req.jsonBody||null } });
   }
