@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix21-ammv4-fallback",
-  "version": "1.6.3",
+  "name": "solana-render-api-fix22-amm-json-source",
+  "version": "1.6.4",
   "private": true,
   "engines": {
     "node": ">=18"
