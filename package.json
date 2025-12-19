@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-clmm-fix13",
-  "version": "1.5.5",
+  "name": "solana-render-api-clmm-fix14",
+  "version": "1.5.6",
   "private": true,
   "engines": {
     "node": ">=18"
@@ -10,6 +10,9 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "@solana/web3.js": "^1.95.4",
+    "@solana/spl-token": "^0.4.9",
+    "@raydium-io/raydium-sdk": "*"
   }
 }
