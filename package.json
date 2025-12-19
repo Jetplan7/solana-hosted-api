@@ -1,19 +1,8 @@
 {
-  "name": "solana-render-api-clmm-auto-ata",
-  "version": "1.5.1",
-  "private": true,
-  "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "name": "solana-clmm-backend",
+  "version": "1.5.1-fix10",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "@solana/web3.js": "^1.95.4",
-    "@solana/spl-token": "^0.4.9",
-    "@raydium-io/raydium-sdk": "*"
   }
 }
