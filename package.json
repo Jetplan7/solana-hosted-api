@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix16-sendpage",
-  "version": "1.5.8",
+  "name": "solana-render-api-fix17-send-setup-swap",
+  "version": "1.5.9",
   "private": true,
   "engines": {
     "node": ">=18"
