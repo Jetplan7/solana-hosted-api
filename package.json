@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-clmm-fix10",
-  "version": "1.5.2",
+  "name": "solana-render-api-clmm-fix11",
+  "version": "1.5.3",
   "private": true,
   "engines": {
     "node": ">=18"
