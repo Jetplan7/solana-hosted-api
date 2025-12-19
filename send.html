@@ -1,9 +1,9 @@
 <!doctype html>
-<html><head><meta charset="utf-8"/><title>Phantom — Raydium CLMM SOL→USDC</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html><head><meta charset="utf-8"/><title>Phantom — Raydium SOL→USDC</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{font-family:system-ui,Arial;max-width:980px;margin:24px auto;padding:0 16px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-input,textarea{width:100%;padding:10px;border-radius:10px;border:1px solid #ddd}
+input{width:100%;padding:10px;border-radius:10px;border:1px solid #ddd}
 button{padding:10px 14px;border-radius:12px;border:1px solid #ddd;cursor:pointer}
 button:disabled{opacity:.6;cursor:not-allowed}
 pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;border-radius:12px}
@@ -12,7 +12,9 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;b
 hr{border:none;border-top:1px solid #eee;margin:12px 0}
 </style></head>
 <body>
-<h2>Phantom — Raydium CLMM SOL → USDC (Mainnet)</h2>
+<h2>Phantom — Raydium SOL → USDC (Mainnet)</h2>
+<p class="small">This backend auto-selects a compatible Raydium pool. It prefers <b>AMM v4</b> when available (most reliable). If only CLMM pools are returned by Raydium API, it will error with a clear message.</p>
+
 <div class="card"><div class="row">
 <button id="connect">Connect Phantom</button>
 <span class="small">Backend: <code id="backend"></code></span>
@@ -23,7 +25,6 @@ hr{border:none;border-top:1px solid #eee;margin:12px 0}
 <label><b>Wrap amount (SOL)</b> <span class="small">(start: 0.01)</span></label>
 <input id="wrapSol" value="0.01"/>
 <div class="row"><button id="doSetup" disabled>Build + Sign + Send Setup TX</button></div>
-<p class="small">Creates USDC ATA + WSOL ATA if missing, then wraps SOL into WSOL. This costs rent for the ATAs (not refundable unless you close them later).</p>
 </div>
 
 <div class="card">
@@ -31,7 +32,7 @@ hr{border:none;border-top:1px solid #eee;margin:12px 0}
 <label><b>Swap amount (SOL)</b></label>
 <input id="swapSol" value="0.01"/>
 <label><b>Slippage (%)</b> <span class="small">(used to auto-compute min-out)</span></label>
-<input id="slip" value="0.5"/>
+<input id="slip" value="0.3"/>
 <div class="row">
 <button id="doQuote" disabled>Quote</button>
 <button id="doSwap" disabled>Build + Sign + Send Swap TX</button>
@@ -127,7 +128,7 @@ doSwapBtn.onclick=async()=>{
     const slippageBps=Math.floor(slip*100);
     out("Building swap tx (server will simulate first)...");
     const j=await postJson("/build-swap-tx",{userPublicKey:provider.publicKey.toString(),amountInLamports,slippageBps,closeWsol:!!closeWsolEl.checked});
-    qout(JSON.stringify({minAmountOutUsdc:j.minAmountOutUsdc, expectedOutUsdc:j.expectedOutUsdc, pool:j.pool, builder:j.builder}, null, 2));
+    qout(JSON.stringify({poolType:j.poolType, pool:j.pool, expectedOutUsdc:j.expectedOutUsdc, minAmountOutUsdc:j.minAmountOutUsdc, builder:j.builder}, null, 2));
     out("Built swap tx. Opening Phantom...");
     await signAndSendTxBase64(j.tx);
   }catch(e){out(e.message||e)}

@@ -11,7 +11,7 @@ const {
 
 dotenv.config();
 
-const VERSION = "1.6.2-fix20-quote-swap-close";
+const VERSION = "1.6.3-fix21-ammv4-fallback";
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
@@ -54,7 +54,7 @@ async function ensureAtaIx(payerOwner, ata, mint){
   return createAssociatedTokenAccountInstruction(payerOwner, ata, payerOwner, mint);
 }
 function addCompute(tx){
-  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_800_000 }));
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
   tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 80_000 }));
 }
 async function simulateOrThrow(tx){
@@ -72,140 +72,90 @@ async function finalizeTx(tx, feePayer, doSimulate){
   if (doSimulate) await simulateOrThrow(tx);
   return tx.serialize({ requireAllSignatures: false }).toString("base64");
 }
+
 async function loadSdk(){
   const mod = await import("@raydium-io/raydium-sdk");
-  return mod && mod.Clmm ? mod : (mod.default ?? mod);
+  return mod && (mod.Liquidity || mod.Clmm) ? mod : (mod.default ?? mod);
 }
-async function fetchBestPool(){
+
+function toUSDC(rawBig){
+  const n = Number(rawBig);
+  return n / 10**USDC_DECIMALS;
+}
+
+// --- Pool selection ---
+async function fetchPools(){
   const url =
     "https://api-v3.raydium.io/pools/info/mint" +
     `?mint1=${USDC_MINT.toBase58()}&mint2=${WSOL_MINT.toBase58()}` +
-    "&poolType=all&poolSortField=default&sortType=desc&pageSize=1&page=1";
+    "&poolType=all&poolSortField=default&sortType=desc&pageSize=50&page=1";
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`Raydium API HTTP ${res.status}`);
   const json = await res.json();
   const list = json?.data?.data || json?.data?.list || json?.data || json?.result?.data || json?.result || [];
-  if (!Array.isArray(list) || !list.length) throw new Error("No pools returned");
-  return list[0];
+  if (!Array.isArray(list) || !list.length) return [];
+  return list;
 }
-function pk(x){
-  if (!x) return null;
-  try {
-    if (x instanceof PublicKey) return x;
-    if (typeof x === "string") return new PublicKey(x);
-  } catch {}
-  return null;
-}
-async function decodeClmmPoolState(sdk, poolId){
-  if (!sdk.PoolInfoLayout?.decode) throw new Error("PoolInfoLayout.decode missing in Raydium SDK");
-  const acc = await connection.getAccountInfo(poolId);
-  if (!acc?.data) throw new Error("Pool account not found");
-  return sdk.PoolInfoLayout.decode(acc.data);
+function isConcentrated(p){ return String(p?.type || "").toLowerCase().includes("concentrated"); }
+function bestAmmPool(pools){
+  // Prefer non-CLMM pools. If multiple, pick highest tvl if present.
+  const amm = pools.filter(p => !isConcentrated(p));
+  if (!amm.length) return null;
+  amm.sort((a,b) => (Number(b.tvl||0) - Number(a.tvl||0)));
+  return amm[0];
 }
 
-function toUSDC(nBig){
-  // nBig bigint (raw units)
-  const n = Number(nBig);
-  return n / 10**USDC_DECIMALS;
+// --- AMM v4 swap build ---
+async function quoteAmm({ sdk, poolJson, amountInLamports }){
+  // Try to compute expected out using Liquidity.fetchInfo + computeAmountOut
+  if (!sdk.Liquidity) throw new Error("Raydium SDK missing Liquidity module");
+  const poolKeys = sdk.jsonInfo2PoolKeys ? sdk.jsonInfo2PoolKeys(poolJson) : null;
+  if (!poolKeys) throw new Error("jsonInfo2PoolKeys not available");
+  // Fetch on-chain pool info
+  const poolInfo = await sdk.Liquidity.fetchInfo({ connection, poolKeys });
+  // base-in: WSOL -> USDC
+  const amountIn = amountInLamports;
+  const { amountOut } = sdk.Liquidity.computeAmountOut({
+    poolKeys,
+    poolInfo,
+    amountIn,
+    currencyOut: poolKeys.quoteMint?.equals?.(USDC_MINT) ? "quote" : "base",
+    slippage: 0,
+  });
+  return { poolKeys, poolInfo, amountOutRaw: BigInt(amountOut) };
 }
 
-async function buildContextForClmm(owner){
-  const sdk = await loadSdk();
-  const apiPool = await fetchBestPool();
-  if (String(apiPool.type).toLowerCase() !== "concentrated") throw new Error(`Expected CLMM pool but got: ${apiPool.type}`);
-  const poolId = new PublicKey(apiPool.id);
-  const decoded = await decodeClmmPoolState(sdk, poolId);
-
-  const poolInfo = { ...decoded };
-  poolInfo.id = poolId;
-  poolInfo.programId = new PublicKey(apiPool.programId);
-
-  // normalize common pubkeys
-  for (const k of ["ammConfig","mintA","mintB","vaultA","vaultB","observationId","tickArrayBitmap"]) {
-    const p = pk(poolInfo[k]);
-    if (p) poolInfo[k] = p;
-  }
-  // poolKeys (full-ish)
-  const poolKeys = {
-    id: poolId,
-    programId: poolInfo.programId,
-    ammConfigId: pk(poolInfo.ammConfig) || pk(poolInfo.ammConfigId),
-    mintA: pk(poolInfo.mintA),
-    mintB: pk(poolInfo.mintB),
-    vaultA: pk(poolInfo.vaultA),
-    vaultB: pk(poolInfo.vaultB),
-    observationId: pk(poolInfo.observationId),
-    tickArrayBitmap: pk(poolInfo.tickArrayBitmap),
-  };
-  // optional ex bitmap pda
-  try {
-    if (sdk.getPdaExBitmapAccount) {
-      const ex = sdk.getPdaExBitmapAccount(poolId);
-      if (ex?.publicKey) poolKeys.exBitmapAccount = ex.publicKey;
-      else if (ex?.key) poolKeys.exBitmapAccount = ex.key;
-    }
-  } catch {}
+async function buildAmmSwapIxs({ sdk, poolJson, owner, amountInLamports, minAmountOutRaw }){
+  if (!sdk.Liquidity) throw new Error("Raydium SDK missing Liquidity module");
+  if (!sdk.jsonInfo2PoolKeys) throw new Error("Raydium SDK missing jsonInfo2PoolKeys");
+  const poolKeys = sdk.jsonInfo2PoolKeys(poolJson);
 
   const { usdcAta, wsolAta } = deriveAtas(owner);
-  return { sdk, apiPool, poolId, poolInfo, poolKeys, usdcAta, wsolAta };
-}
-
-async function quoteSwapBaseIn({ owner, amountInLamports }){
-  const { sdk, poolId, poolInfo, poolKeys } = await buildContextForClmm(owner);
-
-  if (!sdk.Clmm?.computeAmountOut) throw new Error("Clmm.computeAmountOut missing in SDK");
-  // Raydium CLMM compute typically needs direction by mintIn/mintOut
-  const mintIn = WSOL_MINT;
-  const mintOut = USDC_MINT;
-
-  const r = await sdk.Clmm.computeAmountOut({
-    poolInfo,
-    poolKeys,
-    amountIn: BigInt(amountInLamports),
-    mintIn,
-    mintOut,
-    slippage: 0, // we compute min-out ourselves
-  });
-
-  // try to find amountOut in return shape
-  const amountOut = r?.amountOut ?? r?.expectedAmountOut ?? r?.amountOutMin ?? r?.minAmountOut;
-  if (amountOut === undefined || amountOut === null) {
-    throw new Error("computeAmountOut returned unknown shape");
-  }
-  return { poolId, amountOutRaw: BigInt(amountOut) };
-}
-
-async function buildClmmSwapIxs({ owner, amountInLamports, minAmountOutUsdc }){
-  const { sdk, apiPool, poolId, poolInfo, poolKeys, usdcAta, wsolAta } = await buildContextForClmm(owner);
-
   const wsolInfo = await connection.getAccountInfo(wsolAta);
   if (!wsolInfo) throw new Error("WSOL ATA does not exist yet. Run setup first.");
 
-  const ownerInfo = { wallet: owner, tokenAccountIn: wsolAta, tokenAccountOut: usdcAta };
-  const amountIn = BigInt(amountInLamports);
-  const amountOutMin = BigInt(minAmountOutUsdc);
-
-  const tryFns = [];
-  if (sdk.Clmm?.makeSwapBaseInInstructionSimple) tryFns.push({ name: "makeSwapBaseInInstructionSimple", fn: sdk.Clmm.makeSwapBaseInInstructionSimple });
-  if (sdk.Clmm?.makeSwapBaseInInstructions) tryFns.push({ name: "makeSwapBaseInInstructions", fn: sdk.Clmm.makeSwapBaseInInstructions });
-
-  const attempts = [];
-  for (const t of tryFns) {
-    try {
-      const r = await t.fn({ connection, poolInfo, poolKeys, ownerInfo, amountIn, amountOutMin });
-      const inner = r?.innerTransactions || [];
-      const ixs = inner.flatMap(tx => tx.instructions || []);
-      const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
-      if (!finalIxs.length) throw new Error("builder returned no instructions");
-      return { ixs: finalIxs, builder: t.name, poolId, poolType: apiPool.type, poolProgramId: apiPool.programId, usdcAta, wsolAta };
-    } catch (e) {
-      attempts.push({ name: t.name, err: String(e?.message || e) });
-    }
-  }
-  throw new Error("Raydium CLMM builder failed: " + JSON.stringify({ attempts }, null, 2));
+  // Build swap instruction set
+  const r = await sdk.Liquidity.makeSwapInstructionSimple({
+    connection,
+    poolKeys,
+    userKeys: {
+      tokenAccountIn: wsolAta,
+      tokenAccountOut: usdcAta,
+      owner,
+    },
+    amountIn: amountInLamports,
+    amountOut: Number(minAmountOutRaw),
+    fixedSide: "in",
+    makeTxVersion: 0,
+  });
+  const inner = r?.innerTransactions || [];
+  const ixs = inner.flatMap(tx => tx.instructions || []);
+  const finalIxs = ixs.length ? ixs : (Array.isArray(r?.instructions) ? r.instructions : []);
+  if (!finalIxs.length) throw new Error("AMM builder returned no instructions");
+  return { ixs: finalIxs, poolKeys, usdcAta, wsolAta, builder: "Liquidity.makeSwapInstructionSimple" };
 }
 
-// Pages + info
+// Routes
 app.get("/send", (_req, res) => res.sendFile(path.join(__dirname, "send.html")));
 app.get("/send.html", (_req, res) => res.sendFile(path.join(__dirname, "send.html")));
 app.get("/", (_req, res) => res.json({ ok:true, version:VERSION, endpoints:["/version","/send","/derive/:wallet","/quote-swap","/build-setup-tx","/build-swap-tx"] }));
@@ -218,29 +168,46 @@ app.get("/derive/:wallet", (req, res) => {
   } catch (e) { res.status(400).json({ ok:false, error:e.message }); }
 });
 
-// Quote
 app.post("/quote-swap", async (req, res) => {
   try {
     const b = body(req);
     const userPublicKey = requireStr(b.userPublicKey, "userPublicKey");
     const amountInLamports = requireInt(b.amountInLamports, "amountInLamports");
-    const slippageBps = requireInt(b.slippageBps ?? 50, "slippageBps"); // default 0.50%
+    const slippageBps = requireInt(b.slippageBps ?? 30, "slippageBps");
     if (amountInLamports <= 0) throw new Error("amountInLamports must be > 0");
     if (slippageBps < 0 || slippageBps > 2000) throw new Error("slippageBps must be 0..2000");
 
     const user = new PublicKey(userPublicKey);
-    const q = await quoteSwapBaseIn({ owner:user, amountInLamports });
-    const expectedOutUsdc = toUSDC(q.amountOutRaw);
-    const minRaw = (q.amountOutRaw * BigInt(10_000 - slippageBps)) / 10_000n;
-    const minOutUsdc = toUSDC(minRaw);
+    const pools = await fetchPools();
+    const amm = bestAmmPool(pools);
+    if (!amm) {
+      throw new Error("Raydium API returned only CLMM (Concentrated) pools for SOL/USDC. This build uses AMM v4 for reliability. Try again later or switch pool selection.");
+    }
+    const sdk = await loadSdk();
 
-    res.json({ ok:true, version:VERSION, pool:q.poolId.toBase58(), amountInLamports, expectedOutRaw: q.amountOutRaw.toString(), expectedOutUsdc, slippageBps, minOutRaw: minRaw.toString(), minOutUsdc });
+    // Compute expected out. If compute fails due to SDK shape, still return pool selection.
+    let expectedOutRaw = null;
+    let expectedOutUsdc = null;
+    try {
+      const q = await quoteAmm({ sdk, poolJson: amm, amountInLamports });
+      expectedOutRaw = q.amountOutRaw.toString();
+      expectedOutUsdc = toUSDC(q.amountOutRaw);
+    } catch (e) {
+      expectedOutRaw = null;
+      expectedOutUsdc = null;
+    }
+
+    if (expectedOutRaw) {
+      const minRaw = (BigInt(expectedOutRaw) * BigInt(10_000 - slippageBps)) / 10_000n;
+      res.json({ ok:true, version:VERSION, poolType:amm.type, pool:amm.id, amountInLamports, expectedOutRaw, expectedOutUsdc, slippageBps, minOutRaw:minRaw.toString(), minOutUsdc:toUSDC(minRaw) });
+    } else {
+      res.json({ ok:true, version:VERSION, poolType:amm.type, pool:amm.id, amountInLamports, expectedOutRaw:null, expectedOutUsdc:null, slippageBps, note:"Quote compute unavailable in this SDK build; swap will still use slippageBps with minOut=0 unless compute succeeds during build." });
+    }
   } catch (e) {
     res.status(400).json({ ok:false, error:e.message, debug:{ rawBody:req.rawBody||"", jsonError:req.jsonError||null, parsedBody:req.jsonBody||null } });
   }
 });
 
-// Setup
 app.post("/build-setup-tx", async (req, res) => {
   try {
     const b = body(req);
@@ -268,13 +235,12 @@ app.post("/build-setup-tx", async (req, res) => {
   }
 });
 
-// Swap
 app.post("/build-swap-tx", async (req, res) => {
   try {
     const b = body(req);
     const userPublicKey = requireStr(b.userPublicKey, "userPublicKey");
     const amountInLamports = requireInt(b.amountInLamports, "amountInLamports");
-    const slippageBps = requireInt(b.slippageBps ?? 50, "slippageBps");
+    const slippageBps = requireInt(b.slippageBps ?? 30, "slippageBps");
     const closeWsolRequested = !!b.closeWsol;
 
     if (amountInLamports <= 0) throw new Error("amountInLamports must be > 0");
@@ -285,15 +251,32 @@ app.post("/build-swap-tx", async (req, res) => {
     addCompute(tx);
 
     const { usdcAta, wsolAta } = deriveAtas(user);
-
     const createUsdc = await ensureAtaIx(user, usdcAta, USDC_MINT);
     if (createUsdc) tx.add(createUsdc);
 
-    // Quote to compute min-out
-    const q = await quoteSwapBaseIn({ owner:user, amountInLamports });
-    const minRaw = (q.amountOutRaw * BigInt(10_000 - slippageBps)) / 10_000n;
+    const pools = await fetchPools();
+    const amm = bestAmmPool(pools);
+    if (!amm) {
+      throw new Error("Raydium API returned only CLMM (Concentrated) pools for SOL/USDC. This build uses AMM v4 for reliability. (CLMM tick-array routing not enabled in this build.)");
+    }
+    const sdk = await loadSdk();
 
-    const built = await buildClmmSwapIxs({ owner:user, amountInLamports, minAmountOutUsdc: Number(minRaw) });
+    // Try quote for min-out; if quote fails, min-out=0 (still safe-ish with small test trades)
+    let expectedOutRaw = null;
+    let expectedOutUsdc = null;
+    let minOutRaw = 0n;
+    try {
+      const q = await quoteAmm({ sdk, poolJson: amm, amountInLamports });
+      expectedOutRaw = q.amountOutRaw;
+      expectedOutUsdc = toUSDC(q.amountOutRaw);
+      minOutRaw = (q.amountOutRaw * BigInt(10_000 - slippageBps)) / 10_000n;
+    } catch (e) {
+      expectedOutRaw = null;
+      expectedOutUsdc = null;
+      minOutRaw = 0n;
+    }
+
+    const built = await buildAmmSwapIxs({ sdk, poolJson: amm, owner: user, amountInLamports, minAmountOutRaw: minOutRaw });
     for (const ix of built.ixs) tx.add(ix);
 
     let closeWsolApplied = false;
@@ -309,19 +292,17 @@ app.post("/build-swap-tx", async (req, res) => {
     res.json({
       ok:true,
       version:VERSION,
+      poolType: amm.type,
+      pool: amm.id,
       builder: built.builder,
-      pool: built.poolId.toBase58(),
-      poolType: built.poolType,
-      usdcAta: built.usdcAta.toBase58(),
-      wsolAta: built.wsolAta.toBase58(),
       amountInLamports,
-      expectedOutUsdc: toUSDC(q.amountOutRaw),
-      minAmountOutUsdc: toUSDC(minRaw),
+      expectedOutUsdc: expectedOutRaw ? expectedOutUsdc : null,
+      minAmountOutUsdc: expectedOutRaw ? toUSDC(minOutRaw) : null,
       slippageBps,
       closeWsolRequested,
       closeWsolApplied,
       tx: b64,
-      note: "Swap built after quoting; server simulates before returning. Min-out uses slippageBps."
+      note: expectedOutRaw ? "Min-out computed from on-chain quote." : "Min-out is 0 because quote compute failed in this SDK build; keep trades small."
     });
   } catch (e) {
     res.status(400).json({ ok:false, error:e.message, debug:{ rawBody:req.rawBody||"", jsonError:req.jsonError||null, parsedBody:req.jsonBody||null } });

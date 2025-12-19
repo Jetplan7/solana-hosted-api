@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix20-quote-swap-close",
-  "version": "1.6.2",
+  "name": "solana-render-api-fix21-ammv4-fallback",
+  "version": "1.6.3",
   "private": true,
   "engines": {
     "node": ">=18"
