@@ -1,7 +1,6 @@
 <!doctype html>
-<html>
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Solana Swap Sender</title>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Swap Builder</title>
 <style>
 body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:860px;margin:24px auto;padding:0 12px}
 .card{border:1px solid #ddd;border-radius:12px;padding:14px;margin:12px 0}
@@ -12,95 +11,52 @@ button:disabled{opacity:.5;cursor:not-allowed}
 input{padding:10px 12px;border-radius:10px;border:1px solid #bbb;width:100%}
 pre{white-space:pre-wrap;background:#f7f7f7;padding:10px;border-radius:10px;overflow:auto}
 .small{color:#555;font-size:13px}
-</style>
-</head>
+</style></head>
 <body>
-<h2>Setup + Swap (Phantom)</h2>
+<h2>SOL → USDC Swap Builder (Server)</h2>
 <div class="card">
   <div class="row">
     <button id="connect">Connect Phantom</button>
-    <button id="setup" disabled>Build Setup TX</button>
+    <button id="setup" disabled>Build Setup TX (wrap WSOL)</button>
     <button id="swap" disabled>Build Swap TX</button>
   </div>
   <div class="row" style="margin-top:10px">
-    <div>
-      <label>Wrap SOL (lamports)</label>
-      <input id="wrap" value="1000000"/>
-      <div class="small">1,000,000 = 0.001 SOL</div>
-    </div>
-    <div>
-      <label>Swap in (lamports)</label>
-      <input id="amt" value="10000000"/>
-      <div class="small">10,000,000 = 0.01 SOL</div>
-    </div>
-    <div>
-      <label>Slippage (bps)</label>
-      <input id="slip" value="30"/>
-      <div class="small">30 = 0.30%</div>
-    </div>
+    <div><label>Wrap lamports</label><input id="wrap" value="1000000"/><div class="small">0.001 SOL</div></div>
+    <div><label>Swap amount lamports</label><input id="amt" value="10000000"/><div class="small">0.01 SOL</div></div>
+    <div><label>Slippage (bps)</label><input id="slip" value="30"/><div class="small">30 = 0.30%</div></div>
   </div>
-  <div style="margin-top:10px">
-    <label><input type="checkbox" id="closeWsol"/> Close WSOL after swap</label>
-  </div>
-  <div class="small" style="margin-top:8px">This build defaults to <b>no server-side simulation</b> to prevent Render 502 timeouts.</div>
+  <div style="margin-top:8px" class="small">If Raydium list fetch is blocked on Render, server falls back to Jupiter swap tx builder.</div>
 </div>
-
-<div class="card">
-  <b>Log</b>
-  <pre id="log"></pre>
-</div>
-
+<div class="card"><b>Log</b><pre id="log"></pre></div>
 <script>
-const logEl = document.getElementById('log');
-const apiBase = location.origin;
-let pubkey = null;
-
-function log(msg){ logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
-
-async function post(path, body){
-  const res = await fetch(apiBase + path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
-  const txt = await res.text();
-  try { return JSON.parse(txt); } catch(e){ throw new Error("Non-JSON response: " + txt.slice(0,200)); }
+const logEl=document.getElementById('log');
+const api=location.origin;
+let pub=null;
+function log(x){logEl.textContent+=x+"\n";logEl.scrollTop=logEl.scrollHeight;}
+async function post(p,b){
+  const r=await fetch(api+p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
+  const t=await r.text();
+  try{return JSON.parse(t);}catch(e){throw new Error("Non-JSON: "+t.slice(0,200));}
 }
-
-document.getElementById('connect').onclick = async () => {
-  if (!window.solana || !window.solana.isPhantom) { alert("Phantom not found. Open via https URL and ensure extension enabled."); return; }
-  const r = await window.solana.connect();
-  pubkey = r.publicKey.toString();
-  log("Connected: " + pubkey);
-  document.getElementById('setup').disabled = false;
-  document.getElementById('swap').disabled = false;
+document.getElementById('connect').onclick=async()=>{
+  if(!window.solana||!window.solana.isPhantom){alert("Phantom not found. Use https URL + extension enabled.");return;}
+  const r=await window.solana.connect(); pub=r.publicKey.toString();
+  log("Connected: "+pub);
+  document.getElementById('setup').disabled=false;
+  document.getElementById('swap').disabled=false;
 };
-
-document.getElementById('setup').onclick = async () => {
-  try {
-    const wrapLamports = Number(document.getElementById('wrap').value||0);
-    const j = await post("/build-setup-tx", { userPublicKey: pubkey, wrapLamports });
-    if (!j.ok) throw new Error(j.error || "setup failed");
-    log("Setup TX built. Signing...");
-    const txBytes = Uint8Array.from(atob(j.tx), c => c.charCodeAt(0));
-    const signed = await window.solana.signTransaction(new solanaWeb3.Transaction(txBytes)); // fallback if web3 not present
-    // Above line won't work w/out web3. We'll instead use signAndSendTransaction with raw tx via Phantom.
-  } catch(e){
-    log("Setup error: " + e.message);
-    alert(e.message);
-  }
+document.getElementById('setup').onclick=async()=>{
+  const wrapLamports=Number(document.getElementById('wrap').value||0);
+  const j=await post("/build-setup-tx",{userPublicKey:pub,wrapLamports});
+  log(JSON.stringify(j,null,2));
+  alert("Setup TX built. Copy tx base64 from log and sign via your existing send flow or build signer next.");
 };
-
-document.getElementById('swap').onclick = async () => {
-  try {
-    const amountInLamports = Number(document.getElementById('amt').value||0);
-    const slippageBps = Number(document.getElementById('slip').value||0);
-    const closeWsol = document.getElementById('closeWsol').checked;
-    const j = await post("/build-swap-tx", { userPublicKey: pubkey, amountInLamports, slippageBps, closeWsol });
-    if (!j.ok) throw new Error(j.error || "swap failed");
-    log("Swap TX built. Base64 length=" + (j.tx||"").length);
-    log("NOTE: Use the /send flow in previous builds to sign base64; this page is minimal builder-only.");
-    log(JSON.stringify(j, null, 2));
-  } catch(e){
-    log("Swap error: " + e.message);
-    alert(e.message);
-  }
+document.getElementById('swap').onclick=async()=>{
+  const amountInLamports=Number(document.getElementById('amt').value||0);
+  const slippageBps=Number(document.getElementById('slip').value||0);
+  const j=await post("/build-swap-tx",{userPublicKey:pub,amountInLamports,slippageBps,closeWsol:false});
+  log(JSON.stringify(j,null,2));
+  if(j.ok) alert("Swap TX built. You can sign+send the base64 tx in Phantom using your send flow.");
 };
 </script>
 </body></html>
