@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix19-clmm-poolkeys-full",
-  "version": "1.6.1",
+  "name": "solana-render-api-fix20-quote-swap-close",
+  "version": "1.6.2",
   "private": true,
   "engines": {
     "node": ">=18"

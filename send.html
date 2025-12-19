@@ -1,18 +1,18 @@
 <!doctype html>
-<html><head><meta charset="utf-8"/><title>Phantom — Setup + Swap (SOL → USDC)</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html><head><meta charset="utf-8"/><title>Phantom — Raydium CLMM SOL→USDC</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{font-family:system-ui,Arial;max-width:980px;margin:24px auto;padding:0 16px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input,textarea{width:100%;padding:10px;border-radius:10px;border:1px solid #ddd}
-textarea{height:160px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 button{padding:10px 14px;border-radius:12px;border:1px solid #ddd;cursor:pointer}
 button:disabled{opacity:.6;cursor:not-allowed}
 pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;border-radius:12px}
 .card{border:1px solid #eee;border-radius:16px;padding:14px;margin:12px 0}
 .small{color:#666;font-size:13px} code{background:#f3f3f3;padding:2px 6px;border-radius:8px}
+hr{border:none;border-top:1px solid #eee;margin:12px 0}
 </style></head>
 <body>
-<h2>Phantom — Setup + Swap (SOL → USDC)</h2>
+<h2>Phantom — Raydium CLMM SOL → USDC (Mainnet)</h2>
 <div class="card"><div class="row">
 <button id="connect">Connect Phantom</button>
 <span class="small">Backend: <code id="backend"></code></span>
@@ -20,21 +20,26 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;b
 
 <div class="card">
 <h3>1) Setup (Create ATAs + Wrap SOL into WSOL)</h3>
-<label><b>Wrap amount (SOL)</b></label>
-<input id="wrapSol" value="0.001"/>
+<label><b>Wrap amount (SOL)</b> <span class="small">(start: 0.01)</span></label>
+<input id="wrapSol" value="0.01"/>
 <div class="row"><button id="doSetup" disabled>Build + Sign + Send Setup TX</button></div>
-<p class="small">Creates USDC ATA + WSOL ATA if missing, then wraps SOL into WSOL.</p>
+<p class="small">Creates USDC ATA + WSOL ATA if missing, then wraps SOL into WSOL. This costs rent for the ATAs (not refundable unless you close them later).</p>
 </div>
 
 <div class="card">
-<h3>2) Swap (WSOL → USDC)</h3>
+<h3>2) Quote + Swap (WSOL → USDC)</h3>
 <label><b>Swap amount (SOL)</b></label>
-<input id="swapSol" value="0.001"/>
-<label><b>Min out (USDC, optional)</b> <span class="small">(leave 0 to accept any)</span></label>
-<input id="minOut" value="0"/>
-<label class="small"><input type="checkbox" id="closeWsol"/> Close WSOL ATA after swap (optional)</label>
-<p class="small">Tip: leave this OFF until swaps succeed; closing can fail if WSOL ATA isn't the expected one.</p>
-<div class="row"><button id="doSwap" disabled>Build + Sign + Send Swap TX</button></div>
+<input id="swapSol" value="0.01"/>
+<label><b>Slippage (%)</b> <span class="small">(used to auto-compute min-out)</span></label>
+<input id="slip" value="0.5"/>
+<div class="row">
+<button id="doQuote" disabled>Quote</button>
+<button id="doSwap" disabled>Build + Sign + Send Swap TX</button>
+</div>
+<label class="small"><input type="checkbox" id="closeWsol"/> Try to close WSOL ATA after swap (optional). If any WSOL remains, close will fail.</label>
+<hr/>
+<div class="small">Quote result:</div>
+<pre id="quoteBox">none yet</pre>
 </div>
 
 <h3>Result</h3><pre id="out"></pre>
@@ -42,13 +47,15 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;b
 <script src="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"></script>
 <script>
 const out=(m)=>document.getElementById("out").textContent=String(m);
+const qout=(m)=>document.getElementById("quoteBox").textContent=String(m);
 const walletEl=document.getElementById("wallet");
 const backendEl=document.getElementById("backend");
 const wrapSolEl=document.getElementById("wrapSol");
 const swapSolEl=document.getElementById("swapSol");
-const minOutEl=document.getElementById("minOut");
+const slipEl=document.getElementById("slip");
 const closeWsolEl=document.getElementById("closeWsol");
 const doSetupBtn=document.getElementById("doSetup");
+const doQuoteBtn=document.getElementById("doQuote");
 const doSwapBtn=document.getElementById("doSwap");
 
 function getProvider(){
@@ -57,13 +64,12 @@ function getProvider(){
   return null;
 }
 let provider=null;
-
 async function connect(){
   provider=getProvider();
   if(!provider) throw new Error("Phantom provider not found. Make sure Phantom is enabled and refresh.");
   const resp=await provider.connect();
   walletEl.textContent=resp.publicKey.toString();
-  doSetupBtn.disabled=false; doSwapBtn.disabled=false;
+  doSetupBtn.disabled=false; doQuoteBtn.disabled=false; doSwapBtn.disabled=false;
   out("Connected.");
 }
 document.getElementById("connect").onclick=async()=>{try{await connect()}catch(e){out(e.message||e)}};
@@ -81,11 +87,13 @@ async function postJson(path,obj){
   if(!j.ok) throw new Error((j.error||"Request failed")+(j.debug?"\n\n"+JSON.stringify(j.debug,null,2):""));
   return j;
 }
+function n(v){ const x=Number(v); if(!Number.isFinite(x)) throw new Error("Bad number"); return x; }
+
 doSetupBtn.onclick=async()=>{
   try{
     if(!provider||!provider.publicKey) await connect();
-    const sol=Number(wrapSolEl.value);
-    if(!Number.isFinite(sol)||sol<=0) throw new Error("Enter a positive wrap SOL amount (e.g. 0.001).");
+    const sol=n(wrapSolEl.value);
+    if(sol<=0) throw new Error("Enter a positive wrap SOL amount (e.g. 0.01).");
     const wrapLamports=Math.floor(sol*1e9);
     out("Building setup tx...");
     const j=await postJson("/build-setup-tx",{userPublicKey:provider.publicKey.toString(),wrapLamports});
@@ -93,21 +101,38 @@ doSetupBtn.onclick=async()=>{
     await signAndSendTxBase64(j.tx);
   }catch(e){out(e.message||e)}
 };
+
+doQuoteBtn.onclick=async()=>{
+  try{
+    if(!provider||!provider.publicKey) await connect();
+    const sol=n(swapSolEl.value);
+    const slip=n(slipEl.value);
+    if(sol<=0) throw new Error("Enter swap SOL > 0.");
+    if(slip<0 || slip>20) throw new Error("Slippage must be 0..20");
+    const amountInLamports=Math.floor(sol*1e9);
+    const j=await postJson("/quote-swap",{userPublicKey:provider.publicKey.toString(),amountInLamports,slippageBps:Math.floor(slip*100)});
+    qout(JSON.stringify(j, null, 2));
+    out("Quote ok.");
+  }catch(e){out(e.message||e)}
+};
+
 doSwapBtn.onclick=async()=>{
   try{
     if(!provider||!provider.publicKey) await connect();
-    const sol=Number(swapSolEl.value);
-    if(!Number.isFinite(sol)||sol<=0) throw new Error("Enter a positive swap SOL amount (e.g. 0.001).");
-    const minOut=Number(minOutEl.value);
-    if(!Number.isFinite(minOut)||minOut<0) throw new Error("Min out must be >= 0.");
+    const sol=n(swapSolEl.value);
+    const slip=n(slipEl.value);
+    if(sol<=0) throw new Error("Enter swap SOL > 0.");
+    if(slip<0 || slip>20) throw new Error("Slippage must be 0..20");
     const amountInLamports=Math.floor(sol*1e9);
-    const minAmountOutUsdc=Math.floor(minOut*1e6);
+    const slippageBps=Math.floor(slip*100);
     out("Building swap tx (server will simulate first)...");
-    const j=await postJson("/build-swap-tx",{userPublicKey:provider.publicKey.toString(),amountInLamports,minAmountOutUsdc,closeWsol:!!closeWsolEl.checked});
+    const j=await postJson("/build-swap-tx",{userPublicKey:provider.publicKey.toString(),amountInLamports,slippageBps,closeWsol:!!closeWsolEl.checked});
+    qout(JSON.stringify({minAmountOutUsdc:j.minAmountOutUsdc, expectedOutUsdc:j.expectedOutUsdc, pool:j.pool, builder:j.builder}, null, 2));
     out("Built swap tx. Opening Phantom...");
     await signAndSendTxBase64(j.tx);
   }catch(e){out(e.message||e)}
 };
+
 backendEl.textContent=location.origin;
 </script>
 </body></html>
