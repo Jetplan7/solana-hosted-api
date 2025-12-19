@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Phantom Setup + Send (WSOL wrap)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; max-width: 920px; margin: 24px auto; padding: 0 16px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    input, textarea { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ddd; }
+    textarea { height: 170px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    button { padding: 10px 14px; border-radius: 12px; border: 1px solid #ddd; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #f6f6f6; padding: 12px; border-radius: 12px; }
+    .card { border: 1px solid #eee; border-radius: 16px; padding: 14px; margin: 12px 0; }
+    .small { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>Phantom Setup TX (Create ATAs + Wrap SOL into WSOL)</h2>
+  <div class="card">
+    <div class="row">
+      <button id="connect">Connect Phantom</button>
+      <button id="buildSend" disabled>Build + Sign + Send Setup TX</button>
+    </div>
+    <p><b>Wallet:</b> <span id="wallet">not connected</span></p>
+
+    <label><b>Wrap amount (SOL)</b></label>
+    <input id="sol" value="0.001" />
+
+    <p class="small">
+      This will call <code>/build-setup-tx</code> on this same server, then Phantom will sign+send the returned transaction.
+      Make sure you have enough SOL for rent + fee.
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>Optional: Send a Base64 TX (paste)</h3>
+    <textarea id="b64" placeholder="Paste base64 tx here (optional)"></textarea>
+    <div class="row">
+      <button id="sendB64" disabled>Sign + Send Base64 TX</button>
+    </div>
+  </div>
+
+  <h3>Result</h3>
+  <pre id="out"></pre>
+
+  <script src="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"></script>
+  <script>
+    const out = (msg) => document.getElementById("out").textContent = String(msg);
+    const walletEl = document.getElementById("wallet");
+    const buildSendBtn = document.getElementById("buildSend");
+    const sendB64Btn = document.getElementById("sendB64");
+    const solEl = document.getElementById("sol");
+    const b64El = document.getElementById("b64");
+
+    function getProvider() {
+      if (window.solana && window.solana.isPhantom) return window.solana;
+      if (window.phantom && window.phantom.solana && window.phantom.solana.isPhantom) return window.phantom.solana;
+      return null;
+    }
+
+    let provider = null;
+
+    async function connect() {
+      provider = getProvider();
+      if (!provider) throw new Error("Phantom provider not found. Make sure Phantom is enabled and refresh.");
+      const resp = await provider.connect();
+      walletEl.textContent = resp.publicKey.toString();
+      buildSendBtn.disabled = false;
+      sendB64Btn.disabled = false;
+      out("Connected.");
+      return resp.publicKey.toString();
+    }
+
+    document.getElementById("connect").onclick = async () => {
+      try { await connect(); } catch (e) { out(e.message || e); }
+    };
+
+    async function signAndSendTxBase64(b64) {
+      const txBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const tx = solanaWeb3.Transaction.from(txBytes);
+      const { signature } = await provider.signAndSendTransaction(tx);
+      out("Sent! Signature:\n" + signature + "\n\nhttps://solscan.io/tx/" + signature);
+      return signature;
+    }
+
+    buildSendBtn.onclick = async () => {
+      try {
+        if (!provider || !provider.publicKey) await connect();
+        const sol = Number(solEl.value);
+        if (!Number.isFinite(sol) || sol <= 0) throw new Error("Enter a positive SOL amount (e.g. 0.001).");
+        const wrapLamports = Math.floor(sol * 1e9);
+
+        const resp = await fetch("/build-setup-tx", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userPublicKey: provider.publicKey.toString(), wrapLamports })
+        });
+        const j = await resp.json();
+        if (!j.ok) throw new Error("Build failed: " + (j.error || JSON.stringify(j)));
+        if (!j.tx) throw new Error("No tx returned.");
+        out("Built setup tx. Opening Phantom...");
+        await signAndSendTxBase64(j.tx);
+      } catch (e) {
+        out(e.message || e);
+      }
+    };
+
+    sendB64Btn.onclick = async () => {
+      try {
+        if (!provider || !provider.publicKey) await connect();
+        const b64 = (b64El.value || "").trim();
+        if (!b64) throw new Error("Paste base64 first.");
+        await signAndSendTxBase64(b64);
+      } catch (e) {
+        out(e.message || e);
+      }
+    };
+  </script>
+</body>
+</html>
