@@ -11,11 +11,15 @@ const {
 
 dotenv.config();
 
-const VERSION = "1.6.5-fix23-robust-timeouts";
+const VERSION = "1.6.6-fix24-retry-longtimeout";
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
 const SIMULATE_BUILD = String(process.env.SIMULATE_BUILD || "false").toLowerCase() === "true";
+const RAYDIUM_JSON_URL = process.env.RAYDIUM_JSON_URL || "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
+const RAYDIUM_FETCH_TIMEOUT_MS = Number(process.env.RAYDIUM_FETCH_TIMEOUT_MS || 15000);
+const RAYDIUM_FETCH_RETRIES = Number(process.env.RAYDIUM_FETCH_RETRIES || 3);
+
 const connection = new Connection(RPC, "confirmed");
 
 process.on("unhandledRejection", (reason) => console.error("[unhandledRejection]", reason));
@@ -82,8 +86,10 @@ async function loadSdk(){
   return mod && (mod.Liquidity || mod.Clmm) ? mod : (mod.default ?? mod);
 }
 
-// Fetch with timeout + cache
+// Fetch with timeout + retry + cache
 let AMM_CACHE = { ts: 0, pools: null, src: null };
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchJsonWithTimeout(url, ms){
   const ac = new AbortController();
@@ -100,15 +106,25 @@ async function fetchJsonWithTimeout(url, ms){
 async function fetchAmmJson(){
   const now = Date.now();
   if (AMM_CACHE.pools && (now - AMM_CACHE.ts) < 5 * 60_000) return AMM_CACHE;
-  const url = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
-  const json = await fetchJsonWithTimeout(url, 7000);
-  let pools = [];
-  if (Array.isArray(json?.official)) pools = pools.concat(json.official);
-  if (Array.isArray(json?.unOfficial)) pools = pools.concat(json.unOfficial);
-  if (!pools.length && Array.isArray(json)) pools = json;
-  if (!pools.length) throw new Error("Unexpected Raydium v2 sdk json shape");
-  AMM_CACHE = { ts: now, pools, src: url };
-  return AMM_CACHE;
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= RAYDIUM_FETCH_RETRIES; attempt++) {
+    try {
+      const json = await fetchJsonWithTimeout(RAYDIUM_JSON_URL, RAYDIUM_FETCH_TIMEOUT_MS);
+      let pools = [];
+      if (Array.isArray(json?.official)) pools = pools.concat(json.official);
+      if (Array.isArray(json?.unOfficial)) pools = pools.concat(json.unOfficial);
+      if (!pools.length && Array.isArray(json)) pools = json;
+      if (!pools.length) throw new Error("Unexpected Raydium v2 sdk json shape");
+      AMM_CACHE = { ts: now, pools, src: RAYDIUM_JSON_URL };
+      return AMM_CACHE;
+    } catch (e) {
+      lastErr = e;
+      // small backoff
+      await sleep(250 * attempt);
+    }
+  }
+  throw new Error(`Raydium fetch failed after ${RAYDIUM_FETCH_RETRIES} tries: ${String(lastErr?.message || lastErr)}`);
 }
 
 function pickBestAmm(pools){
@@ -176,12 +192,19 @@ async function buildAmmSwapIxs({ sdk, poolJson, owner, amountInLamports, minAmou
 // Routes
 app.get("/send", (_req, res) => res.sendFile(path.join(__dirname, "send.html")));
 app.get("/send.html", (_req, res) => res.sendFile(path.join(__dirname, "send.html")));
-app.get("/", (_req, res) => res.json({ ok:true, version:VERSION, rpc:RPC, simulateBuild:SIMULATE_BUILD, endpoints:["/version","/send","/raydium-source","/derive/:wallet","/quote-swap","/build-setup-tx","/build-swap-tx"] }));
+app.get("/", (_req, res) => res.json({ ok:true, version:VERSION, rpc:RPC, simulateBuild:SIMULATE_BUILD, raydium:{ url:RAYDIUM_JSON_URL, timeoutMs:RAYDIUM_FETCH_TIMEOUT_MS, retries:RAYDIUM_FETCH_RETRIES }, endpoints:["/version","/send","/raydium-source","/derive/:wallet","/quote-swap","/build-setup-tx","/build-swap-tx"] }));
 app.get("/version", (_req, res) => res.json({ ok:true, version:VERSION }));
 app.get("/raydium-source", async (_req, res) => {
   try {
     const c = await fetchAmmJson();
-    res.json({ ok:true, version:VERSION, source:c.src, count:c.pools.length });
+    res.json({ ok:true, version:VERSION, source:c.src, count:c.pools.length, timeoutMs:RAYDIUM_FETCH_TIMEOUT_MS, retries:RAYDIUM_FETCH_RETRIES });
+  } catch (e) { res.status(400).json({ ok:false, error:e.message }); }
+});
+app.get("/derive/:wallet", (req, res) => {
+  try {
+    const owner = new PublicKey(req.params.wallet);
+    const { usdcAta, wsolAta } = deriveAtas(owner);
+    res.json({ ok:true, version:VERSION, wallet:owner.toBase58(), usdcAta:usdcAta.toBase58(), wsolAta:wsolAta.toBase58() });
   } catch (e) { res.status(400).json({ ok:false, error:e.message }); }
 });
 
@@ -259,7 +282,7 @@ app.post("/build-swap-tx", async (req, res) => {
       closeWsolRequested, closeWsolApplied,
       simulateBuild: SIMULATE_BUILD,
       tx: b64,
-      note: SIMULATE_BUILD ? "Built with server-side simulation." : "Built without server-side simulation (prevents Render 502). Sign+send in Phantom; if it fails, paste on-chain error."
+      note: SIMULATE_BUILD ? "Built with server-side simulation." : "Built without server-side simulation. Sign+send in Phantom; if it fails, paste on-chain error."
     });
   } catch (e) {
     res.status(400).json({ ok:false, error:e.message, debug:{ rawBody:req.rawBody||"", jsonError:req.jsonError||null, parsedBody:req.jsonBody||null } });

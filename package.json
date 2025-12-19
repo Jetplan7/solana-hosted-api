@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix23-robust-timeouts",
-  "version": "1.6.5",
+  "name": "solana-render-api-fix24-retry-longtimeout",
+  "version": "1.6.6",
   "private": true,
   "engines": {
     "node": ">=18"
