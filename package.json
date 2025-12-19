@@ -1,6 +1,6 @@
 {
-  "name": "solana-render-api-fix17-send-setup-swap",
-  "version": "1.5.9",
+  "name": "solana-render-api-fix18-guard-closewsol-debug",
+  "version": "1.6.0",
   "private": true,
   "engines": {
     "node": ">=18"

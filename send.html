@@ -23,7 +23,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;b
 <label><b>Wrap amount (SOL)</b></label>
 <input id="wrapSol" value="0.001"/>
 <div class="row"><button id="doSetup" disabled>Build + Sign + Send Setup TX</button></div>
-<p class="small">One-time setup. Creates USDC ATA + WSOL ATA if missing, then wraps SOL into WSOL.</p>
+<p class="small">Creates USDC ATA + WSOL ATA if missing, then wraps SOL into WSOL.</p>
 </div>
 
 <div class="card">
@@ -32,15 +32,9 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;b
 <input id="swapSol" value="0.001"/>
 <label><b>Min out (USDC, optional)</b> <span class="small">(leave 0 to accept any)</span></label>
 <input id="minOut" value="0"/>
-<label class="small"><input type="checkbox" id="closeWsol" checked/> Close WSOL ATA after swap (unwrap leftovers)</label>
+<label class="small"><input type="checkbox" id="closeWsol"/> Close WSOL ATA after swap (optional)</label>
+<p class="small">Tip: leave this OFF until swaps succeed; closing can fail if WSOL ATA isn't the expected one.</p>
 <div class="row"><button id="doSwap" disabled>Build + Sign + Send Swap TX</button></div>
-<p class="small">Builds a Raydium CLMM swap (WSOL → USDC), simulates server-side, then Phantom signs+sends. Use <code>Min out</code> for protection.</p>
-</div>
-
-<div class="card">
-<h3>Debug: send base64 tx</h3>
-<textarea id="b64" placeholder="Paste base64 tx here (optional)"></textarea>
-<div class="row"><button id="sendB64" disabled>Sign + Send Base64 TX</button></div>
 </div>
 
 <h3>Result</h3><pre id="out"></pre>
@@ -54,10 +48,8 @@ const wrapSolEl=document.getElementById("wrapSol");
 const swapSolEl=document.getElementById("swapSol");
 const minOutEl=document.getElementById("minOut");
 const closeWsolEl=document.getElementById("closeWsol");
-const b64El=document.getElementById("b64");
 const doSetupBtn=document.getElementById("doSetup");
 const doSwapBtn=document.getElementById("doSwap");
-const sendB64Btn=document.getElementById("sendB64");
 
 function getProvider(){
   if(window.solana&&window.solana.isPhantom) return window.solana;
@@ -71,9 +63,8 @@ async function connect(){
   if(!provider) throw new Error("Phantom provider not found. Make sure Phantom is enabled and refresh.");
   const resp=await provider.connect();
   walletEl.textContent=resp.publicKey.toString();
-  doSetupBtn.disabled=false; doSwapBtn.disabled=false; sendB64Btn.disabled=false;
+  doSetupBtn.disabled=false; doSwapBtn.disabled=false;
   out("Connected.");
-  return resp.publicKey.toString();
 }
 document.getElementById("connect").onclick=async()=>{try{await connect()}catch(e){out(e.message||e)}};
 
@@ -115,14 +106,6 @@ doSwapBtn.onclick=async()=>{
     const j=await postJson("/build-swap-tx",{userPublicKey:provider.publicKey.toString(),amountInLamports,minAmountOutUsdc,closeWsol:!!closeWsolEl.checked});
     out("Built swap tx. Opening Phantom...");
     await signAndSendTxBase64(j.tx);
-  }catch(e){out(e.message||e)}
-};
-sendB64Btn.onclick=async()=>{
-  try{
-    if(!provider||!provider.publicKey) await connect();
-    const b64=(b64El.value||"").trim();
-    if(!b64) throw new Error("Paste base64 first.");
-    await signAndSendTxBase64(b64);
   }catch(e){out(e.message||e)}
 };
 backendEl.textContent=location.origin;
